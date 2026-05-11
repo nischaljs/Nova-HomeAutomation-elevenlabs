@@ -133,6 +133,37 @@ class FaceRecognitionBridge:
     def __init__(self, data_dir=DATA_DIR, threshold=THRESHOLD):
         self.system = FaceRecognitionSystem(data_dir=data_dir, threshold=threshold)
         self._recog_lock = threading.Lock()
+        self._validate_models()
+
+    @staticmethod
+    def _validate_models():
+        """Make sure YuNet + SFace ONNX files actually load. If either file
+        is partial/corrupt from an interrupted earlier download, delete it
+        so the face_recognition_system lib re-downloads on next access."""
+        from face_recognition_system import detector as det_mod
+        from face_recognition_system import embedder as emb_mod
+        from face_recognition_system.models import MODELS_DIR, MODEL_FILES
+
+        checks = [
+            ("yunet", lambda: det_mod._get_detector(320, 240), "_detector"),
+            ("sface", lambda: emb_mod._get_recognizer(), "_recognizer"),
+        ]
+        for name, load_fn, cache_attr in checks:
+            try:
+                load_fn()
+            except Exception as e:
+                path = MODELS_DIR / MODEL_FILES[name]
+                size = path.stat().st_size if path.exists() else 0
+                print(f"[FACE] {name} model failed to load (size={size}B): {type(e).__name__}: {e}")
+                if path.exists():
+                    print(f"[FACE]   → deleting {path.name} for re-download")
+                    path.unlink()
+                setattr(det_mod if name == "yunet" else emb_mod, cache_attr, None)
+                try:
+                    load_fn()
+                    print(f"[FACE]   ✓ {name} re-downloaded and loaded")
+                except Exception as e2:
+                    print(f"[FACE]   ✗ re-download of {name} also failed: {e2}")
 
     def has_face(self, image: np.ndarray) -> bool:
         small = cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if image.shape[1] > 320 else image

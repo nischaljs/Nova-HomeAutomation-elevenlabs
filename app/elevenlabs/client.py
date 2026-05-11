@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 
-from app.elevenlabs.audio import RobustDefaultAudioInterface
+from app.elevenlabs.adaptive_audio import AdaptiveDefaultAudioInterface
 from app.elevenlabs.context import face_info_to_context_text, face_state_to_context_text
 from app.elevenlabs.tools import build_client_tools
 
@@ -59,7 +59,7 @@ class ElevenLabsAgent:
                 client,
                 self._agent_id,
                 requires_auth=True,
-                audio_interface=RobustDefaultAudioInterface(),
+                audio_interface=AdaptiveDefaultAudioInterface(),
                 client_tools=build_client_tools(),
                 callback_agent_response=lambda r: print(f"[AGENT] {r}"),
                 callback_user_transcript=lambda t: print(f"[USER] {t}"),

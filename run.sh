@@ -35,6 +35,14 @@ if [[ ! -d .venv ]]; then
 else
   # shellcheck disable=SC1091
   source .venv/bin/activate
+  # Re-sync if requirements.txt is newer than the venv's install marker.
+  # Cheap check: stamp the venv after each install, redo install if requirements got newer.
+  STAMP=.venv/.requirements.stamp
+  if [[ ! -f $STAMP ]] || [[ requirements.txt -nt $STAMP ]]; then
+    echo "[run.sh] requirements.txt changed — syncing dependencies ..."
+    pip install -r requirements.txt
+    touch $STAMP
+  fi
 fi
 
 # ── 3. .env ───────────────────────────────────────────────────────────────
