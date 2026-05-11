@@ -10,6 +10,11 @@ from app.elevenlabs.tools import build_client_tools
 CONTEXT_THROTTLE_S = 2.0
 RESTART_DELAY_S = 1.5
 RESTART_BACKOFF_MAX_S = 30.0
+# If a session ends within this many seconds of starting, treat it as a
+# hard failure (audio device missing, etc.) rather than a normal idle
+# timeout. Triggers exponential backoff so we don't burn ElevenLabs
+# connection attempts looping at 1.5s intervals.
+EARLY_FAIL_THRESHOLD_S = 3.0
 
 
 class ElevenLabsAgent:
@@ -66,6 +71,7 @@ class ElevenLabsAgent:
     def _monitor_loop(self):
         backoff = RESTART_DELAY_S
         while not self._stop_requested.is_set():
+            session_started_at = time.monotonic()
             try:
                 conv = self._conversation
                 if conv is None:
@@ -78,15 +84,23 @@ class ElevenLabsAgent:
             if self._stop_requested.is_set():
                 break
 
-            print(f"[AGENT] session ended — restarting in {backoff:.1f}s "
-                  f"(visitor can talk again as soon as the new session is up)")
+            session_duration = time.monotonic() - session_started_at
+            if session_duration < EARLY_FAIL_THRESHOLD_S:
+                backoff = min(backoff * 2, RESTART_BACKOFF_MAX_S)
+                print(f"[AGENT] session died after only {session_duration:.1f}s — "
+                      f"likely a hardware/config problem (check the audio device). "
+                      f"Backing off, next attempt in {backoff:.1f}s")
+            else:
+                backoff = RESTART_DELAY_S
+                print(f"[AGENT] session ended after {session_duration:.0f}s — "
+                      f"restarting in {backoff:.1f}s")
+
             time.sleep(backoff)
             if self._stop_requested.is_set():
                 break
 
             try:
                 self._start_session_blocking()
-                backoff = RESTART_DELAY_S
             except Exception as e:
                 backoff = min(backoff * 2, RESTART_BACKOFF_MAX_S)
                 print(f"[AGENT] restart failed: {type(e).__name__}: {e} — "
