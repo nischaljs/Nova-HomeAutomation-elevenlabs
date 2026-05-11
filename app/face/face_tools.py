@@ -136,34 +136,90 @@ class FaceRecognitionBridge:
         self._validate_models()
 
     @staticmethod
-    def _validate_models():
-        """Make sure YuNet + SFace ONNX files actually load. If either file
-        is partial/corrupt from an interrupted earlier download, delete it
-        so the face_recognition_system lib re-downloads on next access."""
+    def _ensure_model(name: str, min_size: int):
+        """Download `name` model with visible progress reporting if it's
+        missing, too small, or has been deleted by a previous validation
+        failure. Replaces the silent urlretrieve in face_recognition_system
+        with a loop that prints percent + KB/s every ~10%."""
+        import urllib.request
+        from face_recognition_system.models import MODELS_DIR, MODEL_FILES, MODEL_URLS
+
+        path = MODELS_DIR / MODEL_FILES[name]
+        if path.exists():
+            size = path.stat().st_size
+            if size >= min_size:
+                print(f"[FACE] {name}: cached ({size:,} B) ✓")
+                return path
+            print(f"[FACE] {name}: file on disk is only {size:,} B "
+                  f"(expected ≥ {min_size:,} B) — partial download, deleting")
+            path.unlink()
+        else:
+            print(f"[FACE] {name}: not cached yet")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        url = MODEL_URLS[name]
+        print(f"[FACE] {name}: downloading from {url}")
+
+        t0 = time.time()
+        last_logged_pct = -10
+
+        def _progress(blocks: int, blocksize: int, totalsize: int):
+            nonlocal last_logged_pct
+            got = blocks * blocksize
+            if totalsize > 0:
+                pct = int(min(got, totalsize) * 100 / totalsize)
+            else:
+                pct = -1
+            elapsed = max(time.time() - t0, 0.001)
+            kbs = got / elapsed / 1024
+            if totalsize > 0 and pct >= last_logged_pct + 10:
+                print(f"[FACE] {name}: {pct:3d}%  "
+                      f"({got // 1024:>6,} / {totalsize // 1024:,} KB, {kbs:6.0f} KB/s)")
+                last_logged_pct = pct
+
+        urllib.request.urlretrieve(url, path, reporthook=_progress)
+        final_size = path.stat().st_size
+        elapsed = time.time() - t0
+        print(f"[FACE] {name}: download complete — {final_size:,} B in {elapsed:.1f}s "
+              f"({final_size / elapsed / 1024:.0f} KB/s avg)")
+        return path
+
+    def _validate_models(self):
+        """Pre-download + verify-load both ONNX models so the first real
+        recognize call doesn't pay surprise costs. Logs every step so a
+        slow download is visible instead of mysterious silence."""
         from face_recognition_system import detector as det_mod
         from face_recognition_system import embedder as emb_mod
-        from face_recognition_system.models import MODELS_DIR, MODEL_FILES
+
+        print("[FACE] validating face recognition models ...")
+        self._ensure_model("yunet", min_size=200_000)
+        self._ensure_model("sface", min_size=30_000_000)
 
         checks = [
-            ("yunet", lambda: det_mod._get_detector(320, 240), "_detector"),
-            ("sface", lambda: emb_mod._get_recognizer(), "_recognizer"),
+            ("yunet", lambda: det_mod._get_detector(320, 240), det_mod, "_detector"),
+            ("sface", lambda: emb_mod._get_recognizer(), emb_mod, "_recognizer"),
         ]
-        for name, load_fn, cache_attr in checks:
+        for name, load_fn, mod, cache_attr in checks:
             try:
                 load_fn()
+                print(f"[FACE] {name}: loaded into OpenCV ✓")
             except Exception as e:
+                from face_recognition_system.models import MODELS_DIR, MODEL_FILES
                 path = MODELS_DIR / MODEL_FILES[name]
                 size = path.stat().st_size if path.exists() else 0
-                print(f"[FACE] {name} model failed to load (size={size}B): {type(e).__name__}: {e}")
+                print(f"[FACE] {name}: failed to load (size={size:,} B): "
+                      f"{type(e).__name__}: {e}")
                 if path.exists():
-                    print(f"[FACE]   → deleting {path.name} for re-download")
+                    print(f"[FACE] {name}: deleting and retrying download ...")
                     path.unlink()
-                setattr(det_mod if name == "yunet" else emb_mod, cache_attr, None)
+                setattr(mod, cache_attr, None)
+                self._ensure_model(name, min_size=200_000 if name == "yunet" else 30_000_000)
                 try:
                     load_fn()
-                    print(f"[FACE]   ✓ {name} re-downloaded and loaded")
+                    print(f"[FACE] {name}: re-downloaded and loaded ✓")
                 except Exception as e2:
-                    print(f"[FACE]   ✗ re-download of {name} also failed: {e2}")
+                    print(f"[FACE] {name}: re-download still failed: {e2}")
+        print("[FACE] all models ready")
 
     def has_face(self, image: np.ndarray) -> bool:
         small = cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if image.shape[1] > 320 else image
