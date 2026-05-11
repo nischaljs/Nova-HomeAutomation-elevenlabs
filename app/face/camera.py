@@ -10,6 +10,7 @@ CAM_W = 640
 CAM_H = 480
 FALLBACK_W = 320
 FALLBACK_H = 240
+MAX_PROBE_INDEX = 10
 
 
 def _open_picamera2(w, h):
@@ -27,13 +28,37 @@ def _open_picamera2(w, h):
 
 
 def _open_cv2_cam(w, h):
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("No camera device found at index 0.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+    """Probe /dev/video0 .. /dev/videoN until one returns a real frame.
+
+    After a USB replug or reboot, V4L2 indices for the bcm2835 codec/ISP
+    nodes can shift in front of the actual USB webcam — and hard-coding
+    index 0 then fails with 'Not a video capture device'. We try each
+    index, attempt a sample frame, and keep the first one that produces
+    a valid 3-channel image."""
+    last_err: Exception | None = None
+    for idx in range(MAX_PROBE_INDEX + 1):
+        try:
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ok, frame = cap.read()
+            if not ok or frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+                cap.release()
+                continue
+            print(f"[CAMERA] Opened /dev/video{idx} via OpenCV "
+                  f"(frame={frame.shape[1]}x{frame.shape[0]})")
+            return cap
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"No usable V4L2 capture device found in /dev/video0..{MAX_PROBE_INDEX} "
+        f"(last error: {last_err})"
+    )
 
 
 class Camera:
@@ -45,6 +70,10 @@ class Camera:
         self._cam = None
         self._kind = None
         self._init_camera()
+        if self._error:
+            print(f"[CAMERA] ⚠ initialization failed: {self._error}")
+        else:
+            print(f"[CAMERA] Backend: {self._kind}")
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
 
@@ -52,12 +81,14 @@ class Camera:
         try:
             self._cam = _open_picamera2(self._w, self._h)
             self._kind = "picamera2"
+            return
         except Exception:
-            try:
-                self._cam = _open_cv2_cam(self._w, self._h)
-                self._kind = "cv2"
-            except Exception as e:
-                self._error = str(e)
+            pass
+        try:
+            self._cam = _open_cv2_cam(self._w, self._h)
+            self._kind = "cv2"
+        except Exception as e:
+            self._error = str(e)
 
     def _loop(self):
         fb = FrameBuffer()
