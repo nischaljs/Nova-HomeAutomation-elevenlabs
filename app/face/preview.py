@@ -115,11 +115,22 @@ class CameraPreview:
         return "UNKNOWN", RED
 
     def _draw_box(self, display, bbox, text, color):
-        x, y, w, h = (int(v * SCALE_BACK) for v in bbox)
-        cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
-        (tw, th), _ = cv2.getTextSize(text, FONT, 0.65, 2)
-        cv2.rectangle(display, (x, max(0, y - th - 8)), (x + tw + 4, y), color, -1)
-        cv2.putText(display, text, (x + 2, max(th, y - 4)), FONT, 0.65, (255, 255, 255), 2)
+        try:
+            if bbox is None or len(bbox) < 4:
+                return
+            x = int(float(bbox[0]) * SCALE_BACK)
+            y = int(float(bbox[1]) * SCALE_BACK)
+            w = int(float(bbox[2]) * SCALE_BACK)
+            h = int(float(bbox[3]) * SCALE_BACK)
+            pt1 = (x, y)
+            pt2 = (x + w, y + h)
+            cv2.rectangle(display, pt1, pt2, color, 2)
+            (tw, th), _ = cv2.getTextSize(text, FONT, 0.65, 2)
+            cv2.rectangle(display, (x, max(0, y - th - 8)), (x + tw + 4, y), color, -1)
+            cv2.putText(display, text, (x + 2, max(th, y - 4)), FONT, 0.65, (255, 255, 255), 2)
+        except Exception as e:
+            # One malformed bbox shouldn't kill the whole preview thread
+            print(f"[PREVIEW] draw_box error (ignored): {type(e).__name__}: {e}")
 
     def _loop(self):
         fb = FrameBuffer()
@@ -131,39 +142,44 @@ class CameraPreview:
         print("[PREVIEW] Loop started")
 
         while self._running:
-            frame = fb.get_frame()
-            if frame is None:
-                time.sleep(0.03)
-                continue
-
-            frame_count += 1
-            display = frame.copy()
-            now = time.time()
-
-            if now - last_detect >= DETECT_INTERVAL_S:
-                cached_faces = self._detect(frame)
-                last_detect = now
-
-            for f in cached_faces:
-                bbox = f.get("bbox")
-                if bbox is None:
+            try:
+                frame = fb.get_frame()
+                if frame is None:
+                    time.sleep(0.03)
                     continue
-                text, color = self._match_label(bbox)
-                self._draw_box(display, bbox, text, color)
 
-            if frame_count % 30 == 0:
-                self._fps = 30 / max(now - t_fps, 0.001)
-                t_fps = now
-                if frame_count % 300 == 0:
-                    print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces={len(cached_faces)}")
+                frame_count += 1
+                display = frame.copy()
+                now = time.time()
 
-            cv2.putText(display, f"FPS {self._fps:.0f}", (8, 22), FONT, 0.6, (200, 200, 200), 1)
-            cv2.imshow(self._window_name, display)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[PREVIEW] User pressed 'q' — stopping")
-                break
+                if now - last_detect >= DETECT_INTERVAL_S:
+                    cached_faces = self._detect(frame)
+                    last_detect = now
 
-            # Cap frame rate to TARGET_FPS so we don't hog the CPU
-            sleep_time = TARGET_FRAME_INTERVAL_S - (time.time() - now)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                for f in cached_faces:
+                    bbox = f.get("bbox")
+                    if bbox is None:
+                        continue
+                    text, color = self._match_label(bbox)
+                    self._draw_box(display, bbox, text, color)
+
+                if frame_count % 30 == 0:
+                    self._fps = 30 / max(now - t_fps, 0.001)
+                    t_fps = now
+                    if frame_count % 300 == 0:
+                        print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces={len(cached_faces)}")
+
+                cv2.putText(display, f"FPS {self._fps:.0f}", (8, 22), FONT, 0.6, (200, 200, 200), 1)
+                cv2.imshow(self._window_name, display)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("[PREVIEW] User pressed 'q' — stopping")
+                    break
+
+                # Cap frame rate to TARGET_FPS so we don't hog the CPU
+                sleep_time = TARGET_FRAME_INTERVAL_S - (time.time() - now)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            except Exception as e:
+                # Never let the preview thread die — log and continue
+                print(f"[PREVIEW] loop error (ignored): {type(e).__name__}: {e}")
+                time.sleep(0.1)

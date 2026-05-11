@@ -19,28 +19,25 @@ def _register_user_impl(parameters: dict) -> str:
     from app.face.face_tools import FrameBuffer, get_bridge
 
     bridge = get_bridge()
-    # models_ready is guaranteed True here in normal startup — orchestrator
-    # blocks on it before starting the agent. We keep the check as a safety
-    # net in case anything ever calls the tool out of order.
     if not bridge.models_ready:
         print("[TOOL] register_user deferred — face models still loading")
         return ("My face recognition is still warming up — please ask me again "
                 "in a moment, I'll have it ready.")
 
-    # Snapshot the frame at tool-call time to assess crowd state.
+    # Crowd safety check — only refuse if MULTIPLE unknowns are visible
+    # (can't tell which one's name we got). Zero-unknown snapshots are
+    # treated as a transient miss; we proceed and let register_multi
+    # capture frames over the next 1.5s. If it still can't find a face,
+    # it'll return failure with a sensible message.
     snapshot = FrameBuffer().get_frame()
-    if snapshot is None:
-        return "Camera isn't ready yet — try again in a moment."
-
-    current = bridge.recognize_all(snapshot)
-    unknown_count = sum(1 for f in current if f.get("unknown"))
-    if unknown_count != 1:
-        print(f"[TOOL] register_user refused: snapshot has {unknown_count} unknown faces "
-              f"(need exactly 1 to attribute the name correctly)")
-        if unknown_count == 0:
-            return "I don't see a new face in front of the camera right now — could you step in front?"
-        return ("There are multiple new visitors in front of me — could you come up one at a time "
-                "so I save the right name with the right face?")
+    if snapshot is not None:
+        current = bridge.recognize_all(snapshot)
+        unknown_count = sum(1 for f in current if f.get("unknown"))
+        if unknown_count >= 2:
+            print(f"[TOOL] register_user refused: {unknown_count} unknown faces visible "
+                  f"— need them one at a time to attribute the name correctly")
+            return ("There are multiple new visitors in front of me — could you come up "
+                    "one at a time so I save the right name with the right face?")
 
     fb = FrameBuffer()
     frames = []
