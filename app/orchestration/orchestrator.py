@@ -26,38 +26,64 @@ class Orchestrator:
         self._running = True
         print("[ORCH] Starting orchestrator...")
 
+        # Wire face event subscriptions up front so they're ready by the
+        # time the face pipeline starts firing events from its background
+        # task. Subscribing is cheap and idempotent.
+        if not self._skip_face:
+            self.event_bus.subscribe("face_recognized", self._on_face_event)
+            self.event_bus.subscribe("face_unknown", self._on_face_event)
+            self.event_bus.subscribe("face_lost", self._on_face_event)
+
+        # Start the agent FIRST. This is fast (~1s — just opens a WebSocket
+        # to ElevenLabs). The user can hear and respond to the agent right
+        # away, even while the face pipeline is still busy downloading
+        # models on first run.
+        await self.agent.start()
+
         if self._skip_face:
             print("[ORCH] NOVA_SKIP_FACE=1 — running agent-only (no camera, no face)")
         else:
-            await self._start_face_pipeline()
+            # Face pipeline includes potentially slow model downloads
+            # (~38 MB SFace on first run, longer on slow connections).
+            # Build it off the event loop and let polling start once
+            # it's ready — the agent stays responsive throughout.
+            self._background_tasks.append(
+                asyncio.create_task(self._start_face_pipeline_bg())
+            )
 
-        await self.agent.start()
-        print(f"[ORCH] Started {len(self._background_tasks)} background tasks")
+        print(f"[ORCH] orchestrator startup complete "
+              f"({len(self._background_tasks)} background tasks)")
 
-    async def _start_face_pipeline(self):
+    async def _start_face_pipeline_bg(self):
+        print("[ORCH] face pipeline: building in background "
+              "(model downloads may take a minute on first run) ...")
+        try:
+            await asyncio.to_thread(self._init_face_pipeline_blocking)
+            print("[ORCH] face pipeline: ready — starting poll loop")
+            self._background_tasks.append(asyncio.create_task(self.face_monitor.run()))
+            self._background_tasks.append(asyncio.create_task(self._memory_flush_loop()))
+        except Exception as e:
+            print(f"[ORCH] face pipeline failed to start: {type(e).__name__}: {e}")
+            print("[ORCH] agent will keep running without face recognition")
+
+    def _init_face_pipeline_blocking(self):
+        """Synchronous bits — Camera, FaceMonitor (which loads ONNX models).
+        Runs in a worker thread so the asyncio event loop stays responsive."""
         from app.face.camera import Camera
         from app.face.person_memory import get_memory
         from app.face.preview import CameraPreview
         from app.orchestration.face_monitor import FaceMonitor
 
         self._memory = get_memory()
-
-        self.event_bus.subscribe("face_recognized", self._on_face_event)
-        self.event_bus.subscribe("face_unknown", self._on_face_event)
-        self.event_bus.subscribe("face_lost", self._on_face_event)
-
         self.camera = Camera()
         self.preview = CameraPreview()
         self.preview.start()
-        print("[ORCH] Camera + preview started")
+        print("[ORCH] face pipeline: camera + preview started")
 
         self.face_monitor = FaceMonitor(
             self.event_bus, self.state, self.cooldown, preview=self.preview
         )
-        print("[ORCH] FaceMonitor created")
-
-        self._background_tasks.append(asyncio.create_task(self.face_monitor.run()))
-        self._background_tasks.append(asyncio.create_task(self._memory_flush_loop()))
+        print("[ORCH] face pipeline: FaceMonitor created")
 
     async def stop(self):
         print("[ORCH] Stopping orchestrator...")
@@ -77,13 +103,10 @@ class Orchestrator:
     async def _memory_flush_loop(self):
         while self._running:
             await asyncio.sleep(30)
-            await self._memory.flush()
+            if self._memory:
+                await self._memory.flush()
 
     async def _on_face_event(self, data: dict):
-        """One handler for all face events. Every time the tracker fires
-        (someone arrives, someone leaves, an unknown appears) we re-read
-        the full current state from the tracker and push a single aggregated
-        contextual update. The agent always sees the up-to-date room."""
         if self.face_monitor is None:
             return
         state = self.face_monitor.tracker.current_state()
