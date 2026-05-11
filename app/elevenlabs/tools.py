@@ -19,6 +19,9 @@ def _register_user_impl(parameters: dict) -> str:
     from app.face.face_tools import FrameBuffer, get_bridge
 
     bridge = get_bridge()
+    # models_ready is guaranteed True here in normal startup — orchestrator
+    # blocks on it before starting the agent. We keep the check as a safety
+    # net in case anything ever calls the tool out of order.
     if not bridge.models_ready:
         print("[TOOL] register_user deferred — face models still loading")
         return ("My face recognition is still warming up — please ask me again "

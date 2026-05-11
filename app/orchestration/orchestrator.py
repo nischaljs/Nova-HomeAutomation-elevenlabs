@@ -26,42 +26,44 @@ class Orchestrator:
         self._running = True
         print("[ORCH] ━━━ Nova starting up ━━━")
 
-        if not self._skip_face:
+        if self._skip_face:
+            print("[ORCH] NOVA_SKIP_FACE=1 — skipping face pipeline")
+            print("[ORCH] step 1/1 → starting ElevenLabs agent")
+            await self.agent.start()
+            print("[ORCH] step 1/1 ✓ — agent is live")
+        else:
             self.event_bus.subscribe("face_recognized", self._on_face_event)
             self.event_bus.subscribe("face_unknown", self._on_face_event)
             self.event_bus.subscribe("face_lost", self._on_face_event)
             print("[ORCH] face event subscriptions wired")
 
-        print("[ORCH] step 1/2 → starting ElevenLabs agent (fast, ~1–2s)")
-        await self.agent.start()
-        print("[ORCH] step 1/2 ✓ — agent is live. You can talk to it now.")
+            # Step 1: build camera + preview + face monitor, then BLOCK
+            # until face recognition models are loaded. On first run this
+            # is a 2–4 minute SFace download; the agent intentionally does
+            # NOT start until face context is available — we don't want
+            # visitors talking to an agent that's blind to who they are.
+            # On subsequent runs the models are cached so this step is ~1s.
+            print("[ORCH] step 1/2 → bringing up face pipeline + camera ...")
+            await asyncio.to_thread(self._init_face_pipeline_blocking)
+            print("[ORCH] step 1/2 → waiting for face models to be ready "
+                  "(first run only: ~38 MB download — see [FACE] progress lines)")
+            await asyncio.to_thread(self._wait_for_face_models)
+            print("[ORCH] step 1/2 ✓ — face pipeline ready, models loaded")
 
-        if self._skip_face:
-            print("[ORCH] step 2/2 skipped (NOVA_SKIP_FACE=1) — running agent-only")
-        else:
-            print("[ORCH] step 2/2 → starting face pipeline in background "
-                  "(first run will download ~38 MB of models — visible progress below)")
-            self._background_tasks.append(
-                asyncio.create_task(self._start_face_pipeline_bg())
-            )
+            # Start face polling AFTER models are ready
+            self._background_tasks.append(asyncio.create_task(self.face_monitor.run()))
+            self._background_tasks.append(asyncio.create_task(self._memory_flush_loop()))
+
+            print("[ORCH] step 2/2 → starting ElevenLabs agent")
+            await self.agent.start()
+            print("[ORCH] step 2/2 ✓ — agent is live. You can talk to it now.")
 
         print(f"[ORCH] ━━━ startup complete ({len(self._background_tasks)} bg tasks) ━━━")
 
-    async def _start_face_pipeline_bg(self):
-        print("[ORCH] face pipeline: building in background "
-              "(model downloads may take a minute on first run) ...")
-        try:
-            await asyncio.to_thread(self._init_face_pipeline_blocking)
-            print("[ORCH] face pipeline: ready — starting poll loop")
-            self._background_tasks.append(asyncio.create_task(self.face_monitor.run()))
-            self._background_tasks.append(asyncio.create_task(self._memory_flush_loop()))
-        except Exception as e:
-            print(f"[ORCH] face pipeline failed to start: {type(e).__name__}: {e}")
-            print("[ORCH] agent will keep running without face recognition")
-
     def _init_face_pipeline_blocking(self):
-        """Synchronous bits — Camera, FaceMonitor (which loads ONNX models).
-        Runs in a worker thread so the asyncio event loop stays responsive."""
+        """Camera, preview, FaceMonitor — synchronous setup off the event loop.
+        Bridge construction itself is now instant (validation runs in a
+        daemon thread); we'll block on bridge.wait_models_ready() afterward."""
         from app.face.camera import Camera
         from app.face.person_memory import get_memory
         from app.face.preview import CameraPreview
@@ -76,7 +78,12 @@ class Orchestrator:
         self.face_monitor = FaceMonitor(
             self.event_bus, self.state, self.cooldown, preview=self.preview
         )
-        print("[ORCH] face pipeline: FaceMonitor created")
+        print("[ORCH] face pipeline: FaceMonitor created — bridge constructed")
+
+    def _wait_for_face_models(self):
+        from app.face.face_tools import get_bridge
+        bridge = get_bridge()
+        bridge.wait_models_ready()
 
     async def stop(self):
         print("[ORCH] Stopping orchestrator...")

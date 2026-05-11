@@ -148,6 +148,11 @@ class FaceRecognitionBridge:
     def models_ready(self) -> bool:
         return self._models_ready.is_set()
 
+    def wait_models_ready(self, timeout: float | None = None) -> bool:
+        """Block until the background validation thread sets models_ready.
+        Returns True if ready, False if timeout elapsed first."""
+        return self._models_ready.wait(timeout)
+
     def _validate_models_bg(self):
         try:
             self._validate_models()
