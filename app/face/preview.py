@@ -17,9 +17,9 @@ DETECT_SCALE = 0.5
 SCALE_BACK = 1 / DETECT_SCALE
 DETECT_INTERVAL_S = 0.15
 
-# How long to keep displaying the last recognized name after the recognizer
-# starts returning unknown/low-quality/None. Stops the box from flickering
-# Nischal → UNKNOWN → Nischal as the head turns or a single frame goes blurry.
+# How long to keep displaying a recognized name after the recognizer stops
+# returning it. Stops box labels from flickering Name → UNKNOWN → Name as
+# the head turns or a frame goes blurry.
 LABEL_HOLD_S = 3.0
 
 
@@ -28,35 +28,32 @@ class CameraPreview:
         self._window_name = window_name
         self._running = False
         self._thread = None
-        self._face_info = None
+        self._faces_by_id: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._fps = 0.0
         self._enabled = os.environ.get("NOVA_DEBUG", "1") == "1"
-        self._last_label = None
-        self._lost_since: float | None = None
 
-    def update_face(self, face_info: dict | None):
-        """Identity result from the recognition thread (name, confidence)."""
-        has_name = (
-            face_info is not None
-            and face_info.get("name")
-            and face_info.get("name") != "unknown"
-            and not face_info.get("unknown")
-        )
+    def update_faces(self, recognized: list[dict]):
+        """List of recognize_all() results — one entry per detected face."""
+        now = time.time()
         with self._lock:
-            if has_name:
-                self._face_info = face_info
-                self._lost_since = None
-                return
-            if self._face_info is None or not self._face_info.get("name"):
-                self._face_info = face_info
-                return
-            if self._lost_since is None:
-                self._lost_since = time.time()
-            if time.time() - self._lost_since < LABEL_HOLD_S:
-                return
-            self._face_info = face_info
-            self._lost_since = None
+            for f in recognized or []:
+                if f.get("unknown") or not f.get("name") or not f.get("id"):
+                    continue
+                self._faces_by_id[f["id"]] = {
+                    "id": f["id"],
+                    "name": f["name"],
+                    "confidence": f.get("confidence", 0.0),
+                    "bbox": f.get("face_bbox"),
+                    "last_seen": now,
+                }
+            stale = [
+                fid
+                for fid, info in self._faces_by_id.items()
+                if now - info["last_seen"] > LABEL_HOLD_S
+            ]
+            for fid in stale:
+                del self._faces_by_id[fid]
 
     def start(self):
         if not self._enabled:
@@ -75,17 +72,39 @@ class CameraPreview:
 
     def _detect(self, frame):
         try:
-            t0 = time.time()
             small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
-            faces = detect_faces(small) or []
-            return faces
+            return detect_faces(small) or []
         except Exception:
             return []
 
-    def _label_for(self, face: dict | None) -> tuple[str, tuple[int, int, int]]:
-        if face and face.get("name") and face["name"] != "unknown":
-            name = face["name"].title()
-            conf = float(face.get("confidence", 0))
+    def _match_label(self, det_bbox):
+        """Find the recognized face whose stored bbox is closest to det_bbox.
+        Returns (label_text, color)."""
+        if det_bbox is None:
+            return "UNKNOWN", RED
+
+        dx, dy, dw, dh = det_bbox
+        dcx, dcy = dx + dw / 2, dy + dh / 2
+        radius_sq = (max(dw, dh) * 0.6) ** 2
+
+        best = None
+        best_dist = float("inf")
+        with self._lock:
+            entries = list(self._faces_by_id.values())
+        for info in entries:
+            rbbox = info.get("bbox")
+            if rbbox is None:
+                continue
+            rx, ry, rw, rh = rbbox
+            rcx, rcy = rx + rw / 2, ry + rh / 2
+            dist = (dcx - rcx) ** 2 + (dcy - rcy) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = info
+
+        if best is not None and best_dist <= radius_sq:
+            name = str(best["name"]).strip() or "Unknown"
+            conf = float(best.get("confidence", 0.0))
             return f"{name} {conf:.0%}", GREEN
         return "UNKNOWN", RED
 
@@ -118,28 +137,19 @@ class CameraPreview:
             if now - last_detect >= DETECT_INTERVAL_S:
                 cached_faces = self._detect(frame)
                 last_detect = now
-                if frame_count % 100 == 0:
-                    print(f"[PREVIEW] Detected {len(cached_faces)} faces in frame {frame_count}")
-
-            with self._lock:
-                face = self._face_info
-
-            text, color = self._label_for(face)
-            if text != self._last_label:
-                print(f"[PREVIEW] Box label: {text}")
-                self._last_label = text
 
             for f in cached_faces:
                 bbox = f.get("bbox")
                 if bbox is None:
                     continue
+                text, color = self._match_label(bbox)
                 self._draw_box(display, bbox, text, color)
 
             if frame_count % 30 == 0:
                 self._fps = 30 / max(now - t_fps, 0.001)
                 t_fps = now
                 if frame_count % 300 == 0:
-                    print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces_cached={len(cached_faces)}")
+                    print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces={len(cached_faces)}")
 
             cv2.putText(display, f"FPS {self._fps:.0f}", (8, 22), FONT, 0.6, (200, 200, 200), 1)
             cv2.imshow(self._window_name, display)

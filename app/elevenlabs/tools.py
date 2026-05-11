@@ -18,6 +18,22 @@ def _register_user_impl(parameters: dict) -> str:
 
     from app.face.face_tools import FrameBuffer, get_bridge
 
+    bridge = get_bridge()
+    # Snapshot the frame at tool-call time to assess crowd state.
+    snapshot = FrameBuffer().get_frame()
+    if snapshot is None:
+        return "Camera isn't ready yet — try again in a moment."
+
+    current = bridge.recognize_all(snapshot)
+    unknown_count = sum(1 for f in current if f.get("unknown"))
+    if unknown_count != 1:
+        print(f"[TOOL] register_user refused: snapshot has {unknown_count} unknown faces "
+              f"(need exactly 1 to attribute the name correctly)")
+        if unknown_count == 0:
+            return "I don't see a new face in front of the camera right now — could you step in front?"
+        return ("There are multiple new visitors in front of me — could you come up one at a time "
+                "so I save the right name with the right face?")
+
     fb = FrameBuffer()
     frames = []
     t_end = time.time() + REGISTER_DURATION_S
@@ -35,7 +51,7 @@ def _register_user_impl(parameters: dict) -> str:
         return "Camera isn't ready yet — try again in a moment."
 
     print(f"[TOOL] Captured {len(frames)} frames over {REGISTER_DURATION_S}s for '{name}'")
-    result = get_bridge().register_multi(frames, name)
+    result = bridge.register_multi(frames, name)
     if result:
         used = result.get("samples_used", "?")
         print(f"[TOOL] Registered '{name}' from {used} usable samples")

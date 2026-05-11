@@ -173,6 +173,50 @@ class FaceRecognitionBridge:
                 print(f"[FACE] recognize() exception: {type(e).__name__}: {e}")
                 return None
 
+    def recognize_all(self, image: np.ndarray) -> list[dict]:
+        """Recognize every face in the frame that passes the quality gate.
+
+        Returns a list of dicts (one per usable face). Each dict carries
+        either a known identity (id, name, confidence) or `unknown: True`.
+        Low-quality detections are dropped silently so the presence tracker
+        doesn't get jitter."""
+        with self._recog_lock:
+            try:
+                small = (
+                    cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
+                    if image.shape[1] > 320
+                    else image
+                )
+                faces = detect_faces(small)
+                if not faces:
+                    return []
+                matrix, ids = self.system.storage.load_matrix()
+                results: list[dict] = []
+                for face in faces:
+                    ok, why = _face_quality_ok(face, small)
+                    if not ok:
+                        continue
+                    embedding = generate_embedding(small, face["raw"])
+                    if matrix is None:
+                        results.append({"unknown": True, "face_bbox": face["bbox"]})
+                        continue
+                    match = find_best_match(embedding, matrix, ids, THRESHOLD)
+                    if not match:
+                        results.append({"unknown": True, "face_bbox": face["bbox"]})
+                        continue
+                    meta = self.system.storage.get_metadata(match["id"]) or {}
+                    results.append({
+                        "id": match["id"],
+                        "name": meta.get("name", "unknown"),
+                        "confidence": match["confidence"],
+                        "face_bbox": face["bbox"],
+                        "unknown": False,
+                    })
+                return results
+            except Exception as e:
+                print(f"[FACE] recognize_all() exception: {type(e).__name__}: {e}")
+                return []
+
     def register(self, image: np.ndarray, name: str) -> dict | None:
         with self._recog_lock:
             try:

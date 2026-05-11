@@ -3,7 +3,7 @@ import threading
 import time
 
 from app.elevenlabs.audio import RobustDefaultAudioInterface
-from app.elevenlabs.context import face_info_to_context_text
+from app.elevenlabs.context import face_info_to_context_text, face_state_to_context_text
 from app.elevenlabs.tools import build_client_tools
 
 
@@ -114,6 +114,14 @@ class ElevenLabsAgent:
 
     def push_face_context(self, face_info: dict | None):
         text = face_info_to_context_text(face_info)
+        self._send_context(text)
+
+    def push_face_state(self, state: dict):
+        """Multi-person aware update — pass the FacePresenceTracker.current_state()."""
+        text = face_state_to_context_text(state)
+        self._send_context(text)
+
+    def _send_context(self, text: str):
         if not text:
             return
 
@@ -131,6 +139,6 @@ class ElevenLabsAgent:
 
         try:
             conv.send_contextual_update(text)
-            print(f"[AGENT] contextual_update sent: {text[:100]}")
+            print(f"[AGENT] contextual_update sent: {text[:120]}")
         except Exception as e:
             print(f"[AGENT] contextual_update failed: {type(e).__name__}: {e}")

@@ -1,166 +1,146 @@
 import time
+from dataclasses import dataclass, field
 
-from app.orchestration.cooldown_manager import CooldownManager, STABLE_DETECTION_SECONDS
+
+STABLE_DETECTION_SECONDS = 2.0
+UNKNOWN_STABLE_SECONDS = 2.0
+FACE_TRULY_LOST_SECONDS = 5.0
 
 
-KNOWN_TO_UNKNOWN_FLICKER_TOLERANCE = 3.0
+@dataclass
+class _KnownState:
+    face_id: str
+    name: str
+    first_seen: float
+    last_seen: float
+    confidence: float = 0.0
+    published: bool = False
+    lost_published: bool = False
 
 
 class FacePresenceTracker:
+    """Multi-face presence tracker.
+
+    Each poll, the FaceMonitor hands us a list of recognized faces (zero
+    or more known identities + zero or more `unknown` placeholders).
+    The tracker emits per-person events when a face becomes stable
+    (≥ STABLE_DETECTION_SECONDS continuously), and when it leaves
+    (≥ FACE_TRULY_LOST_SECONDS without being seen).
+
+    Unknown faces don't have IDs, so they're tracked in aggregate: a
+    single `face_unknown` event fires once unknowns are stable, with the
+    current count.
+    """
+
     def __init__(self):
-        self._cooldown = CooldownManager()
-        self._current_identity_id: str | None = None
-        self._current_name: str = ""
-        self._current_confidence: float = 0.0
-        self._face_present = False
-        self._last_published_identity: str | None = None
-        self._lost_published = True
-        self._unknown_published = False
-        self._unknown_detection_start: float | None = None
-        self._flicker_unknown_start: float | None = None
+        self._known: dict[str, _KnownState] = {}
+        self._unknown_count: int = 0
+        self._unknown_first_seen: float | None = None
+        self._unknown_published: bool = False
 
-    def update(self, has_face: bool, result: dict | None):
+    def update(self, faces: list[dict]) -> list[dict]:
         now = time.time()
+        events: list[dict] = []
+        seen_known_ids: set[str] = set()
+        unknown_count_this_poll = 0
 
-        if not has_face:
-            return self._handle_no_face(now)
+        for face in faces:
+            if face.get("unknown"):
+                unknown_count_this_poll += 1
+                continue
+            face_id = face.get("id")
+            if not face_id:
+                continue
+            seen_known_ids.add(face_id)
+            state = self._known.get(face_id)
+            if state is None:
+                state = _KnownState(
+                    face_id=face_id,
+                    name=face.get("name", "unknown"),
+                    first_seen=now,
+                    last_seen=now,
+                    confidence=face.get("confidence", 0.0),
+                )
+                self._known[face_id] = state
+            else:
+                state.last_seen = now
+                state.confidence = face.get("confidence", state.confidence)
+                state.name = face.get("name", state.name)
+                if state.lost_published:
+                    state.lost_published = False
+                    state.first_seen = now
+                    state.published = False
 
-        if result and not result.get("unknown", True):
-            return self._handle_known_face(result, now)
+            if not state.published and (now - state.first_seen) >= STABLE_DETECTION_SECONDS:
+                state.published = True
+                events.append({
+                    "event": "face_recognized",
+                    "id": state.face_id,
+                    "name": state.name,
+                    "confidence": state.confidence,
+                })
+
+        self._unknown_count = unknown_count_this_poll
+        if unknown_count_this_poll > 0:
+            if self._unknown_first_seen is None:
+                self._unknown_first_seen = now
+            if (
+                not self._unknown_published
+                and (now - self._unknown_first_seen) >= UNKNOWN_STABLE_SECONDS
+            ):
+                self._unknown_published = True
+                events.append({"event": "face_unknown", "count": unknown_count_this_poll})
         else:
-            return self._handle_unknown_face(now)
+            self._unknown_first_seen = None
+            self._unknown_published = False
 
-    def _handle_no_face(self, now: float) -> dict | None:
-        if not self._face_present:
-            return None
-
-        self._face_present = False
-        identity_id = self._current_identity_id or "unknown"
-
-        entry = self._cooldown.get(identity_id)
-        entry.mark_lost()
-
-        if entry.is_truly_lost and not self._lost_published:
-            self._lost_published = True
-            eid = self._current_identity_id
-            self._current_identity_id = None
-            self._last_published_identity = None
-            print(f"[PRESENCE] Face TRULY LOST: {identity_id}")
-            return {"event": "face_lost", "id": eid}
-
-        if entry.is_temporarily_lost and not self._lost_published:
-            print(f"[PRESENCE] Face temporarily lost: {identity_id} (waiting for return)")
-            return None
-
-        return None
-
-    def _handle_known_face(self, result: dict, now: float) -> dict | None:
-        face_id = result["id"]
-        name = result.get("name", "unknown")
-        confidence = result.get("confidence", 0)
-
-        self._face_present = True
-        self._current_identity_id = face_id
-        self._current_name = name
-        self._current_confidence = confidence
-        self._unknown_published = False
-        self._unknown_detection_start = None
-        self._flicker_unknown_start = None
-
-        entry = self._cooldown.get(face_id)
-        entry.mark_detected()
-
-        if not entry.is_stable:
-            return None
-
-        if face_id != self._last_published_identity:
-            self._lost_published = False
-            self._last_published_identity = face_id
-            print(f"[PRESENCE] Known face stable: {name} (conf={confidence})")
-
-            from app.face.person_memory import get_memory
-            mem = get_memory().get(face_id, name)
-
-            events = [{
-                "event": "face_detected",
-                "id": face_id,
-                "name": name,
-                "confidence": confidence,
-                "memory": mem,
-                "stable": True,
-            }]
-
-            if entry.can_greet:
-                if entry.can_republish:
-                    entry.mark_published()
+        for face_id, state in list(self._known.items()):
+            if face_id in seen_known_ids:
+                continue
+            if (now - state.last_seen) >= FACE_TRULY_LOST_SECONDS:
+                if state.published and not state.lost_published:
+                    state.lost_published = True
                     events.append({
-                        "event": "face_recognized",
-                        "id": face_id,
-                        "name": name,
-                        "confidence": confidence,
-                        "memory": mem,
+                        "event": "face_lost",
+                        "id": state.face_id,
+                        "name": state.name,
                     })
-                else:
-                    print(f"[PRESENCE] Face known but re-publish suppressed (cooldown): {name}")
+                if state.lost_published:
+                    del self._known[face_id]
 
-            return events
+        return events
 
-        return None
+    def current_state(self) -> dict:
+        """Snapshot of who is currently present and stable.
 
-    def _handle_unknown_face(self, now: float) -> dict | None:
-        self._face_present = True
-
-        if self._current_identity_id is not None:
-            if self._flicker_unknown_start is None:
-                self._flicker_unknown_start = now
-                return None
-            if (now - self._flicker_unknown_start) < KNOWN_TO_UNKNOWN_FLICKER_TOLERANCE:
-                return None
-            print(
-                f"[PRESENCE] Face changed to UNKNOWN (was {self._current_identity_id}) "
-                f"after {KNOWN_TO_UNKNOWN_FLICKER_TOLERANCE:.1f}s of continuous unknown"
-            )
-            self._current_identity_id = None
-            self._current_name = ""
-            self._lost_published = False
-            self._last_published_identity = None
-            self._flicker_unknown_start = None
-
-        if self._unknown_detection_start is None:
-            self._unknown_detection_start = now
-
-        if not self._unknown_published and (now - self._unknown_detection_start) >= STABLE_DETECTION_SECONDS:
-            self._unknown_published = True
-            print(f"[PRESENCE] Unknown face stable for {STABLE_DETECTION_SECONDS}s")
-            return [
-                {"event": "face_detected", "unknown": True, "stable": True},
-                {"event": "face_unknown", "stable": True},
-            ]
-
-        return None
+        Returns:
+            {
+              "known": [{id, name, confidence}, ...],   # stable known identities
+              "unknown_count": int,                      # stable unknown count
+            }
+        """
+        return {
+            "known": [
+                {"id": s.face_id, "name": s.name, "confidence": s.confidence}
+                for s in self._known.values()
+                if s.published and not s.lost_published
+            ],
+            "unknown_count": self._unknown_count if self._unknown_published else 0,
+        }
 
     @property
     def current_identity_id(self) -> str | None:
-        return self._current_identity_id
-
-    @property
-    def current_name(self) -> str:
-        return self._current_name
+        for s in self._known.values():
+            if s.published and not s.lost_published:
+                return s.face_id
+        return None
 
     @property
     def face_present(self) -> bool:
-        return self._face_present
-
-    @property
-    def last_published_identity(self) -> str | None:
-        return self._last_published_identity
+        return bool(self._known) or self._unknown_count > 0
 
     def reset(self):
-        self._current_identity_id = None
-        self._current_name = ""
-        self._face_present = False
-        self._last_published_identity = None
-        self._lost_published = True
+        self._known.clear()
+        self._unknown_count = 0
+        self._unknown_first_seen = None
         self._unknown_published = False
-        self._unknown_detection_start = None
-        self._flicker_unknown_start = None

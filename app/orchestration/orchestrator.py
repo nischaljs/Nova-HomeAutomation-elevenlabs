@@ -42,10 +42,9 @@ class Orchestrator:
 
         self._memory = get_memory()
 
-        self.event_bus.subscribe("face_recognized", self._on_face_recognized)
-        self.event_bus.subscribe("face_detected", self._on_face_recognized)
-        self.event_bus.subscribe("face_unknown", self._on_face_unknown)
-        self.event_bus.subscribe("face_lost", self._on_face_lost)
+        self.event_bus.subscribe("face_recognized", self._on_face_event)
+        self.event_bus.subscribe("face_unknown", self._on_face_event)
+        self.event_bus.subscribe("face_lost", self._on_face_event)
 
         self.camera = Camera()
         self.preview = CameraPreview()
@@ -80,13 +79,12 @@ class Orchestrator:
             await asyncio.sleep(30)
             await self._memory.flush()
 
-    async def _on_face_recognized(self, data: dict):
-        if data and data.get("unknown"):
+    async def _on_face_event(self, data: dict):
+        """One handler for all face events. Every time the tracker fires
+        (someone arrives, someone leaves, an unknown appears) we re-read
+        the full current state from the tracker and push a single aggregated
+        contextual update. The agent always sees the up-to-date room."""
+        if self.face_monitor is None:
             return
-        self.agent.push_face_context(data)
-
-    async def _on_face_unknown(self, data: dict):
-        self.agent.push_face_context({"unknown": True})
-
-    async def _on_face_lost(self, data: dict):
-        self.agent.push_face_context(None)
+        state = self.face_monitor.tracker.current_state()
+        self.agent.push_face_state(state)
