@@ -1,0 +1,492 @@
+Accompolished 
+
+kws--> live streamaudio --> server capture speech part --> transcribe --> process --> //(command and response )) live stream audio->--> speaker
+
+to resolve esp quick restart -- small speaker -- latency removal -- offline -- Nepali 
+
+
+#include <Voice_-Assistnce_kws_inferencing.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <SPI.h>
+#include <SD.h>
+#include "driver/i2s.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+
+// ===================== PIN DEFINITIONS =====================
+#define I2S_MIC_SCK 26
+#define I2S_MIC_WS 22
+#define I2S_MIC_SD 25
+#define I2S_PORT_MIC I2S_NUM_0
+
+#define I2S_SPK_BCLK 14
+#define I2S_SPK_LRC 27
+#define I2S_SPK_DOUT 32
+#define I2S_PORT_SPK I2S_NUM_1
+
+#define SD_CS 5
+#define LED_PIN 2
+
+#define SAMPLE_RATE 16000
+#define FRAME_SAMPLES 320
+#define RECORD_TIME 5
+#define CONFIDENCE_THRESHOLD 0.9f
+#define PAUSE_AFTER_DETECT_MS 3000
+
+// ===================== AUDIO BUFFERS =====================
+int32_t i2sBuffer[FRAME_SAMPLES];
+int16_t sendBuffer[FRAME_SAMPLES];
+
+volatile bool playingAudio = false;
+volatile bool streaming = false;
+volatile bool kwsRunning = false;
+volatile bool micInitialized = false;
+
+typedef struct {
+  signed short* buffers[2];
+  unsigned char buf_select;
+  unsigned char buf_ready;
+  unsigned int buf_count;
+  unsigned int n_samples;
+} inference_t;
+
+static inference_t inference;
+static const uint32_t sample_buffer_size = 2048;
+static signed short sampleBuffer[sample_buffer_size];
+static volatile bool record_status = false;
+static bool debug_nn = false;
+
+
+
+
+int fileIndex = 1;
+
+// ===================== WIFI & SERVER =====================
+const char* ssid = "Noo";
+const char* password = "88888888";
+
+const char* serverUrlTest = "http://192.168.1.92:3000/api/test";
+
+// ===================== WEBSOCKET =====================
+WebSocketsClient webSocket;
+
+// ===================== I2S FUNCTIONS =====================
+void setupI2SMIC() {
+  if (micInitialized) return;
+
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_MIC_SCK,
+    .ws_io_num = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SD
+  };
+
+  i2s_driver_install(I2S_PORT_MIC, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT_MIC, &pins);
+  i2s_zero_dma_buffer(I2S_PORT_MIC);
+
+  micInitialized = true;
+}
+
+void setupI2SSpeaker() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 24000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 32,  // Increase this from 12 to 32
+    .dma_buf_len = 512,   // 512 is good
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_SPK_BCLK,
+    .ws_io_num = I2S_SPK_LRC,
+    .data_out_num = I2S_SPK_DOUT,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  i2s_driver_install(I2S_PORT_SPK, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT_SPK, &pins);
+  i2s_zero_dma_buffer(I2S_PORT_SPK);
+}
+// Flush mic DMA buffer and discard first samples to remove startup ticks
+void flushMicStartupNoise(int flushFrames = 6) {
+  size_t bytesRead;
+  int32_t tmp[FRAME_SAMPLES];
+  for (int i = 0; i < flushFrames; i++)
+    i2s_read(I2S_PORT_MIC, tmp, sizeof(tmp), &bytesRead, portMAX_DELAY);
+}
+
+// ===================== KWS CAPTURE =====================
+static void audio_inference_callback(uint32_t n_bytes) {
+  for (int i = 0; i < (int)(n_bytes >> 1); i++) {
+    inference.buffers[inference.buf_select][inference.buf_count++] = sampleBuffer[i];
+    if (inference.buf_count >= inference.n_samples) {
+      inference.buf_select ^= 1;
+      inference.buf_count = 0;
+      inference.buf_ready = 1;
+    }
+  }
+}
+
+static void capture_samples(void* arg) {
+  const int32_t bytes_to_read = (uint32_t)arg;
+  int32_t i2s32[sample_buffer_size];
+  size_t bytes_read;
+
+  while (record_status) {
+    i2s_read(I2S_PORT_MIC, i2s32, bytes_to_read * 2, &bytes_read, 100);
+    int samples = bytes_read / 4;
+    for (int x = 0; x < samples && x < (int)sample_buffer_size; x++)
+      sampleBuffer[x] = (int16_t)(i2s32[x] >> 14);  // use >>14 to match original clean detection
+    audio_inference_callback(samples * 2);
+  }
+  vTaskDelete(NULL);
+}
+
+// ===================== KWS START/STOP =====================
+void startKWS() {
+  if (kwsRunning) return;  // only start if not already running
+
+  inference.buffers[0] = (signed short*)malloc(EI_CLASSIFIER_SLICE_SIZE * sizeof(signed short));
+  inference.buffers[1] = (signed short*)malloc(EI_CLASSIFIER_SLICE_SIZE * sizeof(signed short));
+  if (!inference.buffers[0] || !inference.buffers[1]) {
+    Serial.println("ERR: buffer malloc failed");
+    return;
+  }
+
+  inference.buf_select = 0;
+  inference.buf_count = 0;
+  inference.n_samples = EI_CLASSIFIER_SLICE_SIZE;
+  inference.buf_ready = 0;
+
+  record_status = true;  // allow KWS task to run
+  kwsRunning = true;
+
+  xTaskCreate(capture_samples, "CaptureSamples", 32 * 1024, (void*)sample_buffer_size, 10, NULL);
+  Serial.println("[KWS] Restarted — always listening...");
+}
+
+void stopKWS() {
+  if (!kwsRunning) return;
+  record_status = false;
+  delay(200);
+  free(inference.buffers[0]);
+  free(inference.buffers[1]);
+  inference.buffers[0] = nullptr;
+  inference.buffers[1] = nullptr;
+  kwsRunning = false;
+  Serial.println("[KWS] Stopped.");
+}
+
+
+void startPlayback() {
+  if (playingAudio) return;
+
+  Serial.println("[SPK] Start playback");
+
+  // Stop KWS safely
+  if (kwsRunning) stopKWS();
+  streaming = false;
+
+  // Uninstall MIC to avoid conflicts
+  if (micInitialized) {
+    i2s_driver_uninstall(I2S_PORT_MIC);
+    micInitialized = false;
+  }
+
+  // Initialize speaker I2S
+  setupI2SSpeaker();
+
+  // Zero DMA buffer to prevent garbage at start
+  i2s_zero_dma_buffer(I2S_PORT_SPK);
+
+  playingAudio = true;
+}
+
+void stopPlayback() {
+  if (!playingAudio) return;
+
+  Serial.println("[SPK] Stop playback");
+
+  i2s_zero_dma_buffer(I2S_PORT_SPK);
+  i2s_stop(I2S_PORT_SPK);
+  i2s_driver_uninstall(I2S_PORT_SPK);
+  playingAudio = false;
+
+  // Restore MIC
+  setupI2SMIC();
+  flushMicStartupNoise();
+  startKWS();
+}
+
+// ===================== STREAMING =====================
+unsigned long streamStart = 0;
+
+void startStream() {
+      digitalWrite(2,HIGH);
+  if (streaming) return;
+  Serial.println("[STREAM] Start streaming");
+
+  stopKWS();  // <--- stop KWS first
+  flushMicStartupNoise();
+  streaming = true;
+  streamStart = millis();
+}
+
+void stopStream() {
+  if (!streaming) return;
+  Serial.println("[STREAM] Stop streaming");
+  digitalWrite(2,LOW);
+  delay(50);
+  streaming = false;
+  startKWS();  // <--- restart KWS after streaming
+}
+
+void streamFrame() {
+  if (!streaming) return;
+
+
+  if (millis() - streamStart > 10000) {
+    stopStream();
+    return;
+  }
+
+  size_t bytesRead;
+  i2s_read(I2S_PORT_MIC, i2sBuffer, sizeof(i2sBuffer), &bytesRead, portMAX_DELAY);
+  int samples = bytesRead / 4;
+
+  for (int i = 0; i < samples; i++)
+    sendBuffer[i] = (int16_t)(i2sBuffer[i] >> 14);  // use >>14 for clean audio
+
+  webSocket.sendBIN((uint8_t*)sendBuffer, samples * 2);
+}
+
+// ===================== MAIN LOOP: KWS SLICE =====================
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float* out_ptr) {
+  numpy::int16_to_float(&inference.buffers[inference.buf_select ^ 1][offset], out_ptr, length);
+  return 0;
+}
+
+bool runSlice(String& outLabel, float& outScore) {
+  unsigned long wait_start = millis();
+  while (inference.buf_ready == 0) {
+    delay(1);
+    if (millis() - wait_start > 2000) return false;
+  }
+  inference.buf_ready = 0;
+
+  signal_t signal;
+  signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
+  signal.get_data = &microphone_audio_signal_get_data;
+
+  ei_impulse_result_t result = { 0 };
+  if (run_classifier_continuous(&signal, &result, debug_nn) != EI_IMPULSE_OK) return false;
+
+  int top_index = 0;
+  float top_score = 0.0f;
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    if (result.classification[i].value > top_score) {
+      top_score = result.classification[i].value;
+      top_index = i;
+    }
+  }
+
+  outLabel = String(ei_classifier_inferencing_categories[top_index]);
+  outScore = top_score;
+  return true;
+}
+
+bool isNoise(String label) {
+  label.toLowerCase();
+  return (label == "noise" || label == "unknown" || label == "_noise" || label == "_unknown" || label == "background");
+}
+
+// ===================== WEBSOCKET =====================
+void handleCommandMessage(String msg) {
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+  if (error) {
+    Serial.println("[WS] JSON parse failed");
+    return;
+  }
+
+  String type = doc["type"];
+  if (type != "command") return;
+
+  JsonObject payload = doc["payload"];
+  if (payload.containsKey("light")) {
+    String state = payload["light"];
+    digitalWrite(LED_PIN, state == "on" ? HIGH : LOW);
+    Serial.println("Light " + state);
+  }
+}
+
+// void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+//   if (type == WStype_CONNECTED) Serial.println("[WS] Connected");
+//   if (type == WStype_BIN) {
+//     if (!playingAudio) return;
+
+//     // Use the payload directly as your audio buffer
+//     uint8_t* audioData = payload;
+//     size_t audioLength = length;  // number of bytes in this chunk
+
+//     size_t bytesWritten;
+//     i2s_write(I2S_PORT_SPK, audioData, audioLength, &bytesWritten, portMAX_DELAY);
+//   } else if (type == WStype_TEXT) {
+//     String msg = String((char*)payload);
+//     if (msg == "stop_stream") {
+//       stopStream();
+
+//     } else {
+//       handleCommandMessage(msg);
+//     }
+//   } else if (type == WStype_DISCONNECTED) {
+//     Serial.println("[WS] Disconnected");
+//     if (playingAudio) stopPlayback();
+//   }
+// }
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    if (type == WStype_CONNECTED) Serial.println("[WS] Connected");
+
+    else if (type == WStype_TEXT) {
+        String msg = String((char*)payload);
+        if (msg == "start_stream") startStream();
+        else if (msg == "stop_stream") stopStream();
+        else if (msg == "audio_start") startPlayback();
+        else if (msg == "audio_end") stopPlayback();
+        else handleCommandMessage(msg);
+    }
+
+
+else if (type == WStype_BIN) {
+    if (!playingAudio) return;
+
+    // Use the payload directly as your audio buffer
+    uint8_t* audioData = payload;
+    size_t audioLength = length; // number of bytes in this chunk
+
+    size_t bytesWritten;
+    i2s_write(I2S_PORT_SPK, audioData, audioLength, &bytesWritten, portMAX_DELAY);
+}
+    
+
+    else if (type == WStype_DISCONNECTED) {
+        Serial.println("[WS] Disconnected");
+        if (playingAudio) stopPlayback();
+    }
+}
+
+void listFiles() {
+  File root = SD.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    Serial.print("File: ");
+    Serial.print(file.name());
+    Serial.print(" | Size: ");
+    Serial.println(file.size());
+    file = root.openNextFile();
+  }
+  Serial.println("Done listing files.");
+}
+
+// ===================== SETUP =====================
+void setup() {
+  pinMode(2,OUTPUT);
+  Serial.begin(115200);
+  delay(1000);
+  pinMode(LED_PIN, OUTPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+   Serial.println(WiFi.localIP());
+
+  if (!SD.begin(SD_CS)) Serial.println("SD Failed");
+  else Serial.println("SD OK");
+
+  HTTPClient http;
+  http.begin(serverUrlTest);
+  int httpResponse = http.GET();
+  if (httpResponse > 0) Serial.println(http.getString());
+  else Serial.println("Server test failed");
+  http.end();
+
+  webSocket.begin("192.168.1.92", 8080, "/");
+  webSocket.onEvent(webSocketEvent);
+
+  run_classifier_init();
+  ei_sleep(2000);
+
+  setupI2SMIC();
+  flushMicStartupNoise();
+  startKWS();
+  Serial.println("=== Ready ===");
+}
+
+// ===================== MAIN LOOP =====================
+void loop() {
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    // if (cmd == 'r') recordAndStreamAudio();
+    if (cmd == 'f') listFiles();
+    // else if (cmd == 'd') streamAndPlayAudio();
+    else if (cmd == 'm') webSocket.sendTXT("Hello from ESP");
+    else if (cmd == 's') {
+      Serial.println("[TEST] Requesting server to play audio");
+      webSocket.sendTXT("play_test");
+    }
+  }
+
+  webSocket.loop();
+
+  if (streaming) {
+    streamFrame();
+    return;
+  }
+
+  if (!kwsRunning) return;
+
+  String label = "";
+  float score = 0.0f;
+  if (!runSlice(label, score)) return;
+  if (isNoise(label) || score < CONFIDENCE_THRESHOLD) return;
+
+  Serial.println("╔════════ DETECTED ════════╗");
+  Serial.println("Label: " + label + " | Score: " + String(score, 3));
+  Serial.println("╚═══════════════════════════╝");
+
+  String labelLower = label;
+  labelLower.toLowerCase();
+
+  if (labelLower == "hey nova") 
+  {
+
+    startStream();
+  }
+  else {
+    delay(PAUSE_AFTER_DETECT_MS);
+    inference.buf_ready = 0;
+  }
+}

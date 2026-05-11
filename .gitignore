@@ -1,0 +1,78 @@
+# ----------------------
+# 🐍 Python environment
+# ----------------------
+myvenv/
+venv/
+ENV/
+.venv/
+myvenv/
+venv/
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# ----------------------
+# 🔐 Environment & secrets
+# ----------------------
+.env
+.env.*
+*.env
+
+*.log
+# *.txt
+# cookies.txt
+
+# ----------------------
+# 🧠 AI / Models / Weights
+# ----------------------
+*.onnx
+*.bin
+*.pt
+*.pth
+*.gguf
+*.tflite
+
+# ----------------------
+# 🔊 Audio files
+# ----------------------
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# ----------------------
+# ⚡ Cache / temp files
+# ----------------------
+.cache/
+tmp/
+temp/
+
+# ----------------------
+# 💻 IDE / OS files
+# ----------------------
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# 📦 Build / dist
+# ----------------------
+build/
+dist/
+*.egg-info/
+
+# ----------------------
+# 🧪 Testing / coverage
+# ----------------------
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ----------------------
+# 📝 Misc
+# ----------------------
+*.sqlite3
