@@ -24,35 +24,28 @@ class Orchestrator:
 
     async def start(self):
         self._running = True
-        print("[ORCH] Starting orchestrator...")
+        print("[ORCH] ━━━ Nova starting up ━━━")
 
-        # Wire face event subscriptions up front so they're ready by the
-        # time the face pipeline starts firing events from its background
-        # task. Subscribing is cheap and idempotent.
         if not self._skip_face:
             self.event_bus.subscribe("face_recognized", self._on_face_event)
             self.event_bus.subscribe("face_unknown", self._on_face_event)
             self.event_bus.subscribe("face_lost", self._on_face_event)
+            print("[ORCH] face event subscriptions wired")
 
-        # Start the agent FIRST. This is fast (~1s — just opens a WebSocket
-        # to ElevenLabs). The user can hear and respond to the agent right
-        # away, even while the face pipeline is still busy downloading
-        # models on first run.
+        print("[ORCH] step 1/2 → starting ElevenLabs agent (fast, ~1–2s)")
         await self.agent.start()
+        print("[ORCH] step 1/2 ✓ — agent is live. You can talk to it now.")
 
         if self._skip_face:
-            print("[ORCH] NOVA_SKIP_FACE=1 — running agent-only (no camera, no face)")
+            print("[ORCH] step 2/2 skipped (NOVA_SKIP_FACE=1) — running agent-only")
         else:
-            # Face pipeline includes potentially slow model downloads
-            # (~38 MB SFace on first run, longer on slow connections).
-            # Build it off the event loop and let polling start once
-            # it's ready — the agent stays responsive throughout.
+            print("[ORCH] step 2/2 → starting face pipeline in background "
+                  "(first run will download ~38 MB of models — visible progress below)")
             self._background_tasks.append(
                 asyncio.create_task(self._start_face_pipeline_bg())
             )
 
-        print(f"[ORCH] orchestrator startup complete "
-              f"({len(self._background_tasks)} background tasks)")
+        print(f"[ORCH] ━━━ startup complete ({len(self._background_tasks)} bg tasks) ━━━")
 
     async def _start_face_pipeline_bg(self):
         print("[ORCH] face pipeline: building in background "

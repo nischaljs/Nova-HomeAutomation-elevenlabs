@@ -42,18 +42,20 @@ class ElevenLabsAgent:
         self._last_context_at: float = 0.0
 
     async def start(self):
+        print(f"[AGENT] connecting to ElevenLabs (agent_id={self._agent_id})...")
         await asyncio.to_thread(self._start_session_blocking)
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, daemon=True, name="agent-monitor"
         )
         self._monitor_thread.start()
-        print("[AGENT] persistent monitor running — sessions will auto-restart")
+        print("[AGENT] persistent monitor running — sessions will auto-restart on idle close")
 
     def _start_session_blocking(self):
         from elevenlabs.client import ElevenLabs
         from elevenlabs.conversational_ai.conversation import Conversation
 
         client = ElevenLabs(api_key=self._api_key)
+        print("[AGENT] building Conversation + audio interface ...")
         with self._conv_lock:
             self._conversation = Conversation(
                 client,
@@ -64,9 +66,11 @@ class ElevenLabsAgent:
                 callback_agent_response=lambda r: print(f"[AGENT] {r}"),
                 callback_user_transcript=lambda t: print(f"[USER] {t}"),
             )
+            print("[AGENT] opening WebSocket session to ElevenLabs ...")
             self._conversation.start_session()
             self._session_count += 1
-        print(f"[AGENT] session #{self._session_count} started")
+        print(f"[AGENT] ✓ session #{self._session_count} live "
+              f"— mic open, speaker ready, contextual updates can flow")
 
     def _monitor_loop(self):
         backoff = RESTART_DELAY_S
