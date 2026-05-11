@@ -17,6 +17,12 @@ DETECT_SCALE = 0.5
 SCALE_BACK = 1 / DETECT_SCALE
 DETECT_INTERVAL_S = 0.15
 
+# Cap preview at ~30 FPS — the camera + Qt imshow path was spinning at
+# 80–100 FPS on the Pi, burning CPU that should go to face recognition.
+# 30 FPS is plenty smooth for a live preview and frees ~60% of one core.
+TARGET_FPS = 30
+TARGET_FRAME_INTERVAL_S = 1.0 / TARGET_FPS
+
 # How long to keep displaying a recognized name after the recognizer stops
 # returning it. Stops box labels from flickering Name → UNKNOWN → Name as
 # the head turns or a frame goes blurry.
@@ -156,3 +162,8 @@ class CameraPreview:
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("[PREVIEW] User pressed 'q' — stopping")
                 break
+
+            # Cap frame rate to TARGET_FPS so we don't hog the CPU
+            sleep_time = TARGET_FRAME_INTERVAL_S - (time.time() - now)
+            if sleep_time > 0:
+                time.sleep(sleep_time)

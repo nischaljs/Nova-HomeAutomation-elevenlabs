@@ -166,8 +166,8 @@ class FaceRecognitionBridge:
     def _ensure_model(self, name: str, min_size: int):
         """Download `name` model with visible progress reporting if it's
         missing, too small, or has been deleted by a previous validation
-        failure. Replaces the silent urlretrieve in face_recognition_system
-        with a loop that prints percent + KB/s every ~10%."""
+        failure. Logs every 5% plus an ETA so a 3-minute SFace download
+        on slow Pi internet is never mistaken for a hang."""
         import urllib.request
         from face_recognition_system.models import MODELS_DIR, MODEL_FILES, MODEL_URLS
 
@@ -175,7 +175,7 @@ class FaceRecognitionBridge:
         if path.exists():
             size = path.stat().st_size
             if size >= min_size:
-                print(f"[FACE] {name}: cached ({size:,} B) ✓")
+                print(f"[FACE] {name}: cached ({size:,} B) ✓ — instant load")
                 return path
             print(f"[FACE] {name}: file on disk is only {size:,} B "
                   f"(expected ≥ {min_size:,} B) — partial download, deleting")
@@ -188,26 +188,35 @@ class FaceRecognitionBridge:
         print(f"[FACE] {name}: downloading from {url}")
 
         t0 = time.time()
-        last_logged_pct = -10
+        last_logged_pct = -5
+        last_heartbeat = t0
 
         def _progress(blocks: int, blocksize: int, totalsize: int):
-            nonlocal last_logged_pct
+            nonlocal last_logged_pct, last_heartbeat
             got = blocks * blocksize
+            now = time.time()
+            elapsed = max(now - t0, 0.001)
+            kbs = got / elapsed / 1024
+
             if totalsize > 0:
                 pct = int(min(got, totalsize) * 100 / totalsize)
-            else:
-                pct = -1
-            elapsed = max(time.time() - t0, 0.001)
-            kbs = got / elapsed / 1024
-            if totalsize > 0 and pct >= last_logged_pct + 10:
-                print(f"[FACE] {name}: {pct:3d}%  "
-                      f"({got // 1024:>6,} / {totalsize // 1024:,} KB, {kbs:6.0f} KB/s)")
-                last_logged_pct = pct
+                remaining_kb = max(0, (totalsize - got) / 1024)
+                eta_s = remaining_kb / max(kbs, 0.001)
+                if pct >= last_logged_pct + 5:
+                    print(f"[FACE] {name}: {pct:3d}%  "
+                          f"({got // 1024:>6,} / {totalsize // 1024:,} KB, "
+                          f"{kbs:6.0f} KB/s, ETA {eta_s:5.0f}s)")
+                    last_logged_pct = pct
+                    last_heartbeat = now
+                elif now - last_heartbeat >= 15:
+                    print(f"[FACE] {name}: still downloading… "
+                          f"{got // 1024:,} KB at {kbs:.0f} KB/s")
+                    last_heartbeat = now
 
         urllib.request.urlretrieve(url, path, reporthook=_progress)
         final_size = path.stat().st_size
         elapsed = time.time() - t0
-        print(f"[FACE] {name}: download complete — {final_size:,} B in {elapsed:.1f}s "
+        print(f"[FACE] {name}: ✓ download complete — {final_size:,} B in {elapsed:.1f}s "
               f"({final_size / elapsed / 1024:.0f} KB/s avg)")
         return path
 

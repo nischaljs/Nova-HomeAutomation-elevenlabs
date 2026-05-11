@@ -11,7 +11,7 @@ from app.orchestration.cooldown import CooldownManager
 from app.orchestration.event_bus import EventBus
 from app.orchestration.state import ConversationStateMachine
 
-POLL_INTERVAL = 1.0
+POLL_INTERVAL = 0.5
 
 
 class FaceMonitor:
