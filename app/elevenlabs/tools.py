@@ -19,6 +19,11 @@ def _register_user_impl(parameters: dict) -> str:
     from app.face.face_tools import FrameBuffer, get_bridge
 
     bridge = get_bridge()
+    if not bridge.models_ready:
+        print("[TOOL] register_user deferred — face models still loading")
+        return ("My face recognition is still warming up — please ask me again "
+                "in a moment, I'll have it ready.")
+
     # Snapshot the frame at tool-call time to assess crowd state.
     snapshot = FrameBuffer().get_frame()
     if snapshot is None:

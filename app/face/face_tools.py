@@ -133,10 +133,32 @@ class FaceRecognitionBridge:
     def __init__(self, data_dir=DATA_DIR, threshold=THRESHOLD):
         self.system = FaceRecognitionSystem(data_dir=data_dir, threshold=threshold)
         self._recog_lock = threading.Lock()
-        self._validate_models()
+        # Models load in a background thread so the bridge is usable
+        # immediately. recognize_all/register_multi short-circuit while
+        # models_ready is False, so SFace can take its 3 minutes to download
+        # over slow Pi internet without blocking anything else.
+        self._models_ready = threading.Event()
+        threading.Thread(
+            target=self._validate_models_bg,
+            daemon=True,
+            name="face-models-init",
+        ).start()
 
-    @staticmethod
-    def _ensure_model(name: str, min_size: int):
+    @property
+    def models_ready(self) -> bool:
+        return self._models_ready.is_set()
+
+    def _validate_models_bg(self):
+        try:
+            self._validate_models()
+            self._models_ready.set()
+            print("[FACE] models_ready=True — recognition and registration are live")
+        except Exception as e:
+            print(f"[FACE] background model validation failed: {type(e).__name__}: {e}")
+            print("[FACE] models_ready stays False — recognize/register will short-circuit "
+                  "until you restart the app (and ideally fix the network).")
+
+    def _ensure_model(self, name: str, min_size: int):
         """Download `name` model with visible progress reporting if it's
         missing, too small, or has been deleted by a previous validation
         failure. Replaces the silent urlretrieve in face_recognition_system
@@ -267,6 +289,8 @@ class FaceRecognitionBridge:
         either a known identity (id, name, confidence) or `unknown: True`.
         Low-quality detections are dropped silently so the presence tracker
         doesn't get jitter."""
+        if not self._models_ready.is_set():
+            return []
         with self._recog_lock:
             try:
                 small = (
@@ -313,6 +337,8 @@ class FaceRecognitionBridge:
 
     def register_multi(self, frames: list[np.ndarray], name: str) -> dict | None:
         if not frames:
+            return None
+        if not self._models_ready.is_set():
             return None
         with self._recog_lock:
             try:
@@ -363,13 +389,22 @@ class FaceRecognitionBridge:
 
 FACES_BRIDGE = None
 REG_COLLECTOR = None
+_BRIDGE_INIT_LOCK = threading.Lock()
 
 
 def get_bridge():
+    """Returns the singleton FaceRecognitionBridge.
+
+    Wrapped in a lock so concurrent callers (face pipeline init + a tool
+    callback firing while init is still running) don't both try to
+    construct their own bridge. The old race caused every tool call to
+    spawn a fresh validation that killed the in-progress SFace download.
+    """
     global FACES_BRIDGE
-    if FACES_BRIDGE is None:
-        FACES_BRIDGE = FaceRecognitionBridge()
-    return FACES_BRIDGE
+    with _BRIDGE_INIT_LOCK:
+        if FACES_BRIDGE is None:
+            FACES_BRIDGE = FaceRecognitionBridge()
+        return FACES_BRIDGE
 
 
 def get_collector():
