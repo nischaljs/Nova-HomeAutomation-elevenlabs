@@ -2,8 +2,8 @@ import os
 import time
 
 
-REGISTER_DURATION_S = 3.0
-REGISTER_GAP_S = 0.4
+REGISTER_DURATION_S = 1.5
+REGISTER_GAP_S = 0.25
 
 
 def _register_user_impl(parameters: dict) -> str:

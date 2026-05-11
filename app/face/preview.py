@@ -17,6 +17,11 @@ DETECT_SCALE = 0.5
 SCALE_BACK = 1 / DETECT_SCALE
 DETECT_INTERVAL_S = 0.15
 
+# How long to keep displaying the last recognized name after the recognizer
+# starts returning unknown/low-quality/None. Stops the box from flickering
+# Nischal → UNKNOWN → Nischal as the head turns or a single frame goes blurry.
+LABEL_HOLD_S = 3.0
+
 
 class CameraPreview:
     def __init__(self, window_name="Nova Camera"):
@@ -28,11 +33,30 @@ class CameraPreview:
         self._fps = 0.0
         self._enabled = os.environ.get("NOVA_DEBUG", "1") == "1"
         self._last_label = None
+        self._lost_since: float | None = None
 
     def update_face(self, face_info: dict | None):
         """Identity result from the recognition thread (name, confidence)."""
+        has_name = (
+            face_info is not None
+            and face_info.get("name")
+            and face_info.get("name") != "unknown"
+            and not face_info.get("unknown")
+        )
         with self._lock:
+            if has_name:
+                self._face_info = face_info
+                self._lost_since = None
+                return
+            if self._face_info is None or not self._face_info.get("name"):
+                self._face_info = face_info
+                return
+            if self._lost_since is None:
+                self._lost_since = time.time()
+            if time.time() - self._lost_since < LABEL_HOLD_S:
+                return
             self._face_info = face_info
+            self._lost_since = None
 
     def start(self):
         if not self._enabled:

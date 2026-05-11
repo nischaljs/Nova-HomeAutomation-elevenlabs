@@ -210,7 +210,7 @@ class FaceRecognitionBridge:
                       f"{len(embeddings)} usable / {len(frames)} captured "
                       f"(rejects: {rejects[:5]})")
 
-                if len(embeddings) < 3:
+                if len(embeddings) < 2:
                     return None
 
                 stacked = np.stack(embeddings)
