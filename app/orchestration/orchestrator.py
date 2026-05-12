@@ -376,6 +376,14 @@ class Orchestrator:
             return
         state = self.face_monitor.tracker.current_state()
         self.agent.push_face_state(state)
+        # Tell the agent who this session's notes should be attributed
+        # to. Picks the most-confident known visitor in the current
+        # scene; the save_session_notes tool reads this same value to
+        # know which PersonMemory row to append to.
+        known = state.get("known") or []
+        if known:
+            top = max(known, key=lambda p: p.get("confidence", 0))
+            self.agent.note_session_subject(top.get("id"), top.get("name"))
 
     async def stop(self):
         print("[ORCH] Stopping orchestrator...")

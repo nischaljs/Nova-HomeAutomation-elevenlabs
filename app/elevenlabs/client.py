@@ -4,9 +4,12 @@ import threading
 import time
 
 from app.elevenlabs.adaptive_audio import AdaptiveDefaultAudioInterface
+from app.elevenlabs.chime import ensure_chime_wav, play_chime_blocking
 from app.elevenlabs.context import face_info_to_context_text, face_state_to_context_text
 from app.elevenlabs.fallback import ensure_fallback_wav, play_fallback_blocking
-from app.elevenlabs.tools import build_client_tools
+from app.elevenlabs.summarizer import fallback_summarize
+from app.elevenlabs.tools import build_client_tools, get_current_subject, set_current_subject
+from app.face.person_memory import get_memory
 from app.orchestration.net_probe import get_net_stats
 
 
@@ -107,6 +110,24 @@ class ElevenLabsAgent:
         # doesn't have to wait for espeak. Returns None if espeak-ng
         # isn't installed — we just won't have a fallback then.
         self._fallback_wav = ensure_fallback_wav()
+        # Pre-generate the wake chime WAV. Plays once per session open
+        # so the user knows Nova heard them step into frame before her
+        # first word. Synthesized with numpy — never fails to generate
+        # except in pathological cases (read-only home, broken numpy).
+        self._chime_wav = ensure_chime_wav()
+
+        # Running transcript for the *currently open* session. Captured
+        # from the user_transcript / agent_response callbacks, drained
+        # into PersonMemory.notes (summarized) at session close so each
+        # visitor's memory grows with real durable facts instead of
+        # raw conversation snippets.
+        self._session_transcript: list[dict] = []
+        # The face_id we attribute the current session's memory to.
+        # Updated by Orchestrator on each face event — by the time the
+        # session closes, this should be set to whoever Nova was just
+        # talking to. None if we don't know (rare).
+        self._session_face_id: str | None = None
+        self._session_face_name: str | None = None
 
         # Outgoing context — last text + when we last sent it, used to
         # throttle duplicate updates. Pending texts are flushed the
@@ -355,9 +376,33 @@ class ElevenLabsAgent:
                     return False
             except Exception:
                 continue
+        # Audio device hot-unplug check. If the user yanks the USB mic
+        # mid-conversation, the WebSocket stays open and ElevenLabs
+        # waits patiently for audio that's never coming. Detecting it
+        # here lets us close the dead session and reopen with a fresh
+        # audio interface that re-probes the default device.
+        if self._audio_interface is not None:
+            try:
+                if not self._audio_interface.is_input_alive():
+                    print("[AGENT] audio input stream is dead "
+                          "(USB mic unplugged?) — treating session as died")
+                    return False
+            except Exception:
+                pass
         return True
 
     def _try_open_session(self):
+        # Play the wake chime BEFORE start_session_blocking so the user
+        # hears "I'm listening" while we're still negotiating the WS.
+        # On a fast link the chime + WS open take ~500-700 ms total,
+        # and Nova's first audio lands right after the chime tail —
+        # smooth from the user's side.
+        if self._chime_wav is not None:
+            try:
+                play_chime_blocking(self._chime_wav)
+            except Exception as e:
+                print(f"[AGENT] chime playback failed (ignored): "
+                      f"{type(e).__name__}: {e}")
         try:
             self._start_session_blocking()
             self._restart_backoff = RESTART_DELAY_S
@@ -454,8 +499,17 @@ class ElevenLabsAgent:
             # opening, so the gap is end-to-end STT + LLM + TTS-first-
             # byte. Reported in the periodic [NET] log line.
             net_stats.note_user_transcript()
+            self._session_transcript.append({"role": "user", "content": text})
             print(f"[USER] {text}")
 
+        def _on_agent_response(text: str):
+            self._session_transcript.append({"role": "assistant", "content": text})
+            print(f"[AGENT] {text}")
+
+        # Start a fresh transcript for this session so cross-session
+        # contamination can't happen even if the previous session
+        # ended uncleanly.
+        self._session_transcript = []
         with self._conv_lock:
             self._conversation = Conversation(
                 client,
@@ -463,7 +517,7 @@ class ElevenLabsAgent:
                 requires_auth=True,
                 audio_interface=self._audio_interface,
                 client_tools=build_client_tools(),
-                callback_agent_response=lambda r: print(f"[AGENT] {r}"),
+                callback_agent_response=_on_agent_response,
                 callback_user_transcript=_on_user_transcript,
             )
             self._conversation.start_session()
@@ -477,6 +531,17 @@ class ElevenLabsAgent:
             self._conversation = None
         if conv is None:
             return
+        # Summarize the just-ended session into the visitor's memory
+        # BEFORE we tear down state. Runs in a worker so a slow Groq
+        # response can't hold up the lifecycle thread (we don't await
+        # it — fire-and-forget into a thread, on the assumption that
+        # most sessions have a few seconds between close and the next
+        # open).
+        try:
+            self._summarize_and_persist_async()
+        except Exception as e:
+            print(f"[AGENT] summary scheduling failed (ignored): "
+                  f"{type(e).__name__}: {e}")
         try:
             conv.end_session()
         except Exception as e:
@@ -490,3 +555,78 @@ class ElevenLabsAgent:
                 self._audio_interface.gate.reset()
         except Exception as e:
             print(f"[AGENT] gate reset failed (ignored): {type(e).__name__}: {e}")
+
+    def note_session_subject(self, face_id: str | None, name: str | None):
+        """Orchestrator tells the agent (and the shared tools-module
+        pointer) who Nova is currently talking to. Updated on every
+        face_recognized event — the LAST known value at close time
+        wins, which is the right behavior if a session was about two
+        people who came up together.
+
+        Two consumers:
+          * `save_session_notes` tool reads `get_current_subject()` and
+            attributes its notes to that face_id. This is the *primary*
+            memory path — agent calls the tool inline whenever the
+            visitor mentions something durable.
+          * `_summarize_and_persist` (fallback path) reads our own
+            cached fields below when the session ends ABRUPTLY without
+            the agent having had time to call the tool.
+        """
+        if face_id:
+            self._session_face_id = face_id
+        if name:
+            self._session_face_name = name
+        # Also update the shared pointer the tool reads.
+        set_current_subject(face_id, name)
+
+    def _summarize_and_persist_async(self):
+        """Fallback for abrupt close.
+
+        The primary memory path is the agent calling save_session_notes
+        inline during the conversation. THIS path only runs when the
+        session closed and we want to scrape any leftover regex-
+        extractable facts from the transcript that didn't make it via
+        the tool. It's a safety net for sessions cut short by network
+        drops, USB unplugs, or users walking away mid-fact.
+        """
+        transcript = list(self._session_transcript)
+        face_id = self._session_face_id
+        face_name = self._session_face_name
+        if not transcript or not face_id:
+            return
+        threading.Thread(
+            target=self._summarize_and_persist,
+            args=(transcript, face_id, face_name),
+            daemon=True,
+            name="session-summary-fallback",
+        ).start()
+
+    def _summarize_and_persist(self, transcript: list[dict],
+                                face_id: str, face_name: str | None):
+        try:
+            bullets = fallback_summarize(transcript)
+        except Exception as e:
+            print(f"[SUMMARY] fallback_summarize raised: "
+                  f"{type(e).__name__}: {e}")
+            return
+        if not bullets:
+            return  # silent — no news is good news on the fallback path
+        try:
+            mem = get_memory()
+            entry = mem.get(face_id, face_name or "")
+            notes = entry.setdefault("notes", [])
+            added = 0
+            for b in bullets:
+                if b not in notes:
+                    notes.append(b)
+                    added += 1
+            if len(notes) > 20:
+                entry["notes"] = notes[-20:]
+            mem._mark_dirty(face_id)
+            if added:
+                print(f"[SUMMARY] fallback added {added} regex notes for "
+                      f"{face_name or face_id} (agent didn't call "
+                      f"save_session_notes — likely abrupt close)")
+        except Exception as e:
+            print(f"[SUMMARY] persist failed: "
+                  f"{type(e).__name__}: {e}")

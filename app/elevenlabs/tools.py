@@ -1,5 +1,32 @@
 import os
+import threading
 import time
+
+
+# Shared "who is the agent talking to right now" pointer. The
+# orchestrator's face-event handler writes here on every recognized
+# face; client tools (save_session_notes, confirm_user fallback) read
+# here when they need to attribute their action to a specific
+# PersonMemory row. Plain dict under a lock — no IPC machinery needed
+# because everything runs in the same process.
+_CURRENT_SUBJECT: dict = {"face_id": None, "name": None}
+_CURRENT_SUBJECT_LOCK = threading.Lock()
+
+
+def set_current_subject(face_id: str | None, name: str | None):
+    """Called by the orchestrator whenever a face_recognized event
+    fires. Subsequent client-tool calls will attribute their results
+    to this subject by default."""
+    with _CURRENT_SUBJECT_LOCK:
+        if face_id is not None:
+            _CURRENT_SUBJECT["face_id"] = face_id
+        if name is not None:
+            _CURRENT_SUBJECT["name"] = name
+
+
+def get_current_subject() -> tuple[str | None, str | None]:
+    with _CURRENT_SUBJECT_LOCK:
+        return _CURRENT_SUBJECT.get("face_id"), _CURRENT_SUBJECT.get("name")
 
 
 REGISTER_DURATION_S = 2.5
@@ -142,11 +169,110 @@ def _register_user_impl(parameters: dict) -> str:
     return response
 
 
-def build_client_tools():
-    """Returns a ClientTools instance with `register_user` registered AND
-    diagnostic logging on every tool-call attempt — including calls to
-    tools that aren't registered (which would otherwise vanish silently).
+_CONFIRM_REASONS_TO_AGENT = {
+    "models_not_ready": (
+        "My face recognition isn't fully loaded yet — but I'll remember "
+        "their name in conversation. Just respond warmly without "
+        "calling confirm_user again this session."
+    ),
+    "no_name": (
+        "I didn't catch which name to confirm. Treat this turn as if "
+        "the user confirmed verbally — no need to retry the tool."
+    ),
+    "name_not_in_db": (
+        "That name isn't in my face database yet. If you suspect they "
+        "haven't been registered, call register_user instead — but "
+        "only if the camera context says they're unknown."
+    ),
+    "no_face_in_frame": (
+        "I couldn't see a face in frame right now. Just continue the "
+        "conversation warmly — no need to retry."
+    ),
+}
+
+
+def _confirm_user_impl(parameters: dict) -> str:
+    """Online-learning tool: when the user confirms an uncertain face
+    match (band=guess/likely → 'yes that's me'), blend the current
+    frame's embedding into their stored identity so future recognitions
+    of this same person get more accurate over time.
+
+    Silent on success — the agent shouldn't announce that it just
+    'saved' anything; the user already said yes, that's enough."""
+    name = (parameters or {}).get("name", "").strip()
+    print(f"[TOOL] confirm_user invoked with name='{name}' params={parameters}")
+    if os.getenv("NOVA_SKIP_FACE") == "1":
+        return "Confirmed. Continue the conversation naturally."
+
+    from app.face.face_tools import FrameBuffer, get_bridge
+    bridge = get_bridge()
+    snapshot = FrameBuffer().get_frame()
+    if snapshot is None:
+        return "Camera isn't ready right now — continue the conversation naturally."
+
+    result = bridge.reinforce_by_name(snapshot, name)
+    if result.get("ok"):
+        return "Confirmed silently. Continue the conversation naturally — do not announce that anything was saved."
+    reason = result.get("reason", "unknown")
+    explain = _CONFIRM_REASONS_TO_AGENT.get(
+        reason.split(":")[0] if ":" in reason else reason,
+        "I couldn't reinforce the identity this time — continue the conversation naturally."
+    )
+    print(f"[TOOL] confirm_user soft-fail: reason={reason}")
+    return explain
+
+
+def _save_session_notes_impl(parameters: dict) -> str:
+    """Inline memory-write tool. The agent (Gemini) decides when the
+    visitor said something durable enough to remember — fact, interest,
+    goal, preference — and calls this with a short bullet.
+
+    Lives entirely on the Pi: the tool call costs no extra ElevenLabs
+    minutes beyond what the conversation was already burning. The LLM
+    deciding what to extract is the SAME one running the conversation,
+    so we're not paying for a second pass through any model.
+
+    Failure modes are deliberately silent — we return guidance to the
+    agent, not error strings the user would hear, because the user
+    isn't supposed to know notes are being saved.
     """
+    note = (parameters or {}).get("note", "").strip()
+    if not note:
+        return "Empty note — continue the conversation naturally."
+
+    face_id, name = get_current_subject()
+    if not face_id:
+        # Could happen if the agent is talking to an unknown visitor
+        # (register_user hasn't fired yet) or to nobody (a glitched
+        # context). Silently drop. Saving anonymous notes would lose
+        # the link to a person anyway.
+        print(f"[TOOL] save_session_notes: no current subject — "
+              f"dropping note: {note[:80]}")
+        return "Continue the conversation naturally."
+
+    try:
+        from app.face.person_memory import get_memory
+        mem = get_memory()
+        entry = mem.get(face_id, name or "")
+        notes = entry.setdefault("notes", [])
+        if note in notes:
+            return "Continue the conversation naturally."
+        notes.append(note)
+        if len(notes) > 20:
+            entry["notes"] = notes[-20:]
+        mem._mark_dirty(face_id)
+        print(f"[TOOL] save_session_notes ('{name or face_id}'): {note!r}")
+    except Exception as e:
+        print(f"[TOOL] save_session_notes failed: {type(e).__name__}: {e}")
+        return "Continue the conversation naturally."
+    return "Continue the conversation naturally."
+
+
+def build_client_tools():
+    """Returns a ClientTools instance with `register_user` + `confirm_user`
+    registered AND diagnostic logging on every tool-call attempt —
+    including calls to tools that aren't registered (which would
+    otherwise vanish silently)."""
     from elevenlabs.conversational_ai.conversation import ClientTools
 
     class LoggingClientTools(ClientTools):
@@ -161,5 +287,7 @@ def build_client_tools():
 
     tools = LoggingClientTools()
     tools.register("register_user", _register_user_impl)
+    tools.register("confirm_user", _confirm_user_impl)
+    tools.register("save_session_notes", _save_session_notes_impl)
     print(f"[TOOL] Client tools wired up: {list(tools.tools.keys())}")
     return tools

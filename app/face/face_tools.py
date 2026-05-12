@@ -475,6 +475,123 @@ class FaceRecognitionBridge:
             self._invalidate_matrix_cache()
         return result
 
+    def reinforce_by_name(
+        self,
+        image: np.ndarray,
+        name: str,
+        new_weight: float = 0.30,
+    ) -> dict:
+        """Online learning: when an uncertain match is confirmed by the
+        user, blend the current frame's embedding INTO the existing
+        identity's stored embedding. Over weeks of use, an identity's
+        average embedding tracks how the user actually looks now
+        (different lighting, hairstyle, weight, glasses) instead of
+        being frozen at registration time.
+
+        `new_weight` is how much the new frame counts vs the existing
+        average — 0.30 means 70 % old + 30 % new, which lets a single
+        confirmation nudge the average without one bad frame ruining
+        the identity. Lower = more conservative, higher = more
+        responsive to recent appearance.
+
+        Returns: {"ok": bool, "reason": str|None, "id": str|None}.
+        Failures fall through with a reason the agent can read aloud
+        ("you're not in frame right now", "I'm not sure which face is
+        yours", etc.).
+        """
+        if not self._models_ready.is_set():
+            return {"ok": False, "reason": "models_not_ready", "id": None}
+        if not name:
+            return {"ok": False, "reason": "no_name", "id": None}
+
+        # Find the identity_id by name. case-insensitive prefix so
+        # 'Nischal' matches 'nischal' / 'Nischal Bhattarai'.
+        target_name = name.strip().lower()
+        identity_id = None
+        identities = self.system.storage.list_identities() or {}
+        for fid, meta in identities.items():
+            stored = (meta or {}).get("name", "").strip().lower()
+            if stored == target_name:
+                identity_id = fid
+                break
+            if not identity_id and stored.startswith(target_name):
+                identity_id = fid  # fallback to prefix match
+        if identity_id is None:
+            return {"ok": False, "reason": "name_not_in_db", "id": None}
+
+        with self._recog_lock:
+            try:
+                # Detect the largest face in the current frame so we
+                # know we have a single, clear subject to reinforce
+                # against. Same DETECT_SCALE the rest of the pipeline
+                # uses so coordinates line up.
+                small = (
+                    cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
+                    if image.shape[1] > 320
+                    else image
+                )
+                faces = detect_faces(small) or []
+                if not faces:
+                    return {"ok": False, "reason": "no_face_in_frame", "id": identity_id}
+                # Pick the biggest face — most likely the engaged user.
+                faces.sort(key=lambda f: f["bbox"][2] * f["bbox"][3], reverse=True)
+                face = faces[0]
+                ok, why = _face_quality_ok(face, small)
+                if not ok:
+                    return {"ok": False, "reason": f"quality:{why}", "id": identity_id}
+
+                new_emb = generate_embedding(small, face["raw"]).astype(np.float32)
+                n = float(np.linalg.norm(new_emb))
+                if n <= 0:
+                    return {"ok": False, "reason": "zero_norm_embedding", "id": identity_id}
+                new_emb = new_emb / n
+
+                # Load the existing stored embedding (single .npy per
+                # identity, already L2-normalized from register_multi).
+                from face_recognition_system.models import MODELS_DIR  # noqa: F401
+                existing_emb = None
+                for emb, fid in zip(*self.system.storage.load_all()):
+                    if fid == identity_id:
+                        existing_emb = emb.astype(np.float32)
+                        break
+                if existing_emb is None:
+                    return {"ok": False, "reason": "embedding_missing", "id": identity_id}
+
+                # Weighted average, then renormalize to keep all
+                # embeddings on the same hypersphere the matcher
+                # assumes. A naive average without renormalize would
+                # bias future cosine similarities.
+                blended = (1.0 - new_weight) * existing_emb + new_weight * new_emb
+                blended = blended / float(np.linalg.norm(blended))
+
+                # Persist by writing back to the embedding file
+                # directly. storage.save() would create a *new* row
+                # with a fresh UUID, which is not what we want — we
+                # want to update the existing identity in place.
+                emb_path = (
+                    self.system.storage.embeddings_dir
+                    / f"{identity_id}.npy"
+                )
+                np.save(emb_path, blended)
+                # Invalidate both caches: the bridge's matrix cache,
+                # and FaceStorage's internal cache (its load_all keeps
+                # a snapshot we just wrote past).
+                self._invalidate_matrix_cache()
+                try:
+                    self.system.storage._cache_valid = False
+                    self.system.storage._matrix = None
+                except AttributeError:
+                    pass
+                meta = identities.get(identity_id) or {}
+                print(f"[FACE] reinforced '{meta.get('name', name)}' "
+                      f"(id={identity_id}) with new frame at "
+                      f"weight={new_weight}")
+                return {"ok": True, "reason": None, "id": identity_id}
+            except Exception as e:
+                print(f"[FACE] reinforce_by_name failed: "
+                      f"{type(e).__name__}: {e}")
+                return {"ok": False, "reason": f"exception:{type(e).__name__}", "id": identity_id}
+
     def list_identities(self) -> dict:
         return self.system.list_identities()
 

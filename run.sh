@@ -69,4 +69,16 @@ if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
   echo "[run.sh] No display server detected — running headless (NOVA_HEADLESS=1)"
 fi
 
-exec python -m app.main 2>&1 | tee /tmp/nova-run.log
+# Log rotation: keep exactly two files on disk — the current run (which
+# overwrites on launch) and the most recent previous run (renamed
+# .prev). On a Pi with 32 GB SD card and a long-running deployment,
+# unbounded logs would eventually fill the disk. Two files = bounded.
+# We move (not truncate) so a crash log from the previous run survives
+# in .prev, available for one debug cycle after the issue.
+NOVA_LOG=/tmp/nova-run.log
+if [[ -f "$NOVA_LOG" ]]; then
+  mv -f "$NOVA_LOG" "${NOVA_LOG}.prev"
+  echo "[run.sh] Rotated previous log → ${NOVA_LOG}.prev"
+fi
+
+exec python -m app.main 2>&1 | tee "$NOVA_LOG"

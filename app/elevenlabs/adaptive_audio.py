@@ -145,6 +145,23 @@ class AdaptiveDefaultAudioInterface(AudioInterface):
     def gate(self) -> SpeechGate:
         return self._gate
 
+    def is_input_alive(self) -> bool:
+        """Best-effort check that the USB mic is still there. Used by
+        the agent lifecycle to detect hot-unplug — if the user pulls
+        out the USB mic mid-conversation, the input stream silently
+        stops producing frames but the session's WebSocket happily
+        stays open, leaving Nova mute. Returns False when we can
+        confirm the stream is dead so the lifecycle thread can rebuild
+        the audio interface (which re-probes the default device).
+        """
+        s = getattr(self, "in_stream", None)
+        if s is None:
+            return False
+        try:
+            return bool(s.is_active())
+        except Exception:
+            return False
+
     def output(self, audio: bytes):
         # Tell the gate Nova just produced speaker audio. The gate uses
         # this to switch to the stricter barge-in threshold (1.5 s of

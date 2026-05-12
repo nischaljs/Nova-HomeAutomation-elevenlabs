@@ -50,6 +50,14 @@ DETECT_TARGET_W = int(os.environ.get("NOVA_DETECT_W", "480"))
 DETECT_TARGET_H = int(os.environ.get("NOVA_DETECT_H", "360"))
 DETECT_INTERVAL_S = float(os.environ.get("NOVA_DETECT_INTERVAL_S", "0.15"))
 RECOGNIZE_INTERVAL_S = float(os.environ.get("NOVA_RECOGNIZE_INTERVAL_S", "0.5"))
+# Idle-mode throttling. When nobody's been in front of the camera for
+# IDLE_AFTER_S seconds, drop detection from 6.6 Hz to ~1 Hz. That's a
+# ~70 % CPU cut during empty-room time without sacrificing wake-up
+# responsiveness — the moment a face appears in any of those 1-Hz
+# detect ticks, we drop back to the fast rate immediately. Important
+# for battery operation on a mobile robot platform.
+IDLE_AFTER_S = float(os.environ.get("NOVA_IDLE_AFTER_S", "60.0"))
+IDLE_DETECT_INTERVAL_S = float(os.environ.get("NOVA_IDLE_DETECT_INTERVAL_S", "1.0"))
 # Minimum sleep between ticks even if everything was instant — stops a
 # loop from pinning a core when there's no work to do.
 MIN_SLEEP_S = 0.02
@@ -184,12 +192,37 @@ class VisionPipeline:
     # ------------------------------------------------------------------
 
     def _detect_loop(self):
+        # Cached so the per-tick idle-mode log doesn't fire every loop.
+        # Flipping between fast/idle is reported once per transition,
+        # not per tick — same pattern as the ENGAGE TRUE/FALSE log.
+        was_idle = False
         while self._running:
             t0 = time.monotonic()
             frame = self._fb.get_frame()
             if frame is None:
                 time.sleep(0.04)
                 continue
+
+            # Decide this tick's pacing. presence_lost_for_s comes from
+            # EngagementState — it counts up while no face is visible
+            # and resets to ~0 the moment one appears. So as soon as
+            # someone walks in, the very next iteration uses the fast
+            # interval (the one this tick is sleeping on doesn't matter
+            # — we always wake at the slower rate, see a face, then
+            # publish the next detection at the fast rate).
+            is_idle = self._engagement.presence_lost_for_s() >= IDLE_AFTER_S
+            current_interval = (
+                IDLE_DETECT_INTERVAL_S if is_idle else DETECT_INTERVAL_S
+            )
+            if is_idle != was_idle:
+                if is_idle:
+                    print(f"[VISION] entering idle mode (no face seen for "
+                          f"{IDLE_AFTER_S:.0f}s) — detect rate "
+                          f"{1/IDLE_DETECT_INTERVAL_S:.1f}Hz")
+                else:
+                    print(f"[VISION] leaving idle mode — back to "
+                          f"{1/DETECT_INTERVAL_S:.1f}Hz detect rate")
+                was_idle = is_idle
 
             try:
                 src_h, src_w = frame.shape[:2]
@@ -240,7 +273,7 @@ class VisionPipeline:
                       f"{type(e).__name__}: {e}")
 
             elapsed = time.monotonic() - t0
-            sleep_left = max(MIN_SLEEP_S, DETECT_INTERVAL_S - elapsed)
+            sleep_left = max(MIN_SLEEP_S, current_interval - elapsed)
             time.sleep(sleep_left)
 
     # ------------------------------------------------------------------

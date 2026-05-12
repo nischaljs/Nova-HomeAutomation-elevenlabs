@@ -1,0 +1,42 @@
+[Unit]
+# Systemd unit template for running Nova as a service on a Raspberry Pi.
+# Edit the User and WorkingDirectory lines for your install, then:
+#   sudo cp deploy/nova.service /etc/systemd/system/nova.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nova
+#   journalctl -u nova -f          # live tail of Nova's logs via systemd
+Description=Nova ElevenLabs Conversational Agent
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+# Change `pi` to your actual login if different.
+User=pi
+# Change to wherever you cloned the repo.
+WorkingDirectory=/home/pi/Nova-HomeAutomation
+# run.sh handles venv activation, dep install, headless detection, log
+# rotation, and exec into python -m app.main. Letting systemd call it
+# means a single source of truth for how Nova starts.
+ExecStart=/home/pi/Nova-HomeAutomation/run.sh
+
+# Restart on crash but not on clean exit (so `systemctl stop nova` stays stopped).
+Restart=on-failure
+# Backoff between restarts so a flapping config doesn't burn CPU.
+RestartSec=5
+
+# Headless robots have no DISPLAY; run.sh exports NOVA_HEADLESS=1 in
+# that case anyway. Setting it here too makes the unit safe even if
+# someone runs it from a session that inherits a stale DISPLAY=:0.
+Environment="NOVA_HEADLESS=1"
+Environment="PYTHONUNBUFFERED=1"
+
+# Give Nova up to 10 s after SIGTERM before SIGKILL so PersonMemory
+# can flush, the ElevenLabs WS can close cleanly, and PyAudio streams
+# can shut down. Less = leaks audio devices on restart.
+TimeoutStopSec=10
+
+# Sensible resource limits for a kiosk Pi.
+LimitNOFILE=2048
+
+[Install]
+WantedBy=multi-user.target
