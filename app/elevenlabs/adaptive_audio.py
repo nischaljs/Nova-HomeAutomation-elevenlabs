@@ -5,6 +5,9 @@ import numpy as np
 
 from elevenlabs.conversational_ai.conversation import AudioInterface
 
+from app.elevenlabs.speech_gate import SpeechGate
+from app.orchestration.net_probe import get_net_stats
+
 
 SDK_RATE = 16000
 INPUT_BUFFER_MS = 250
@@ -34,7 +37,7 @@ class AdaptiveDefaultAudioInterface(AudioInterface):
     RobustDefaultAudioInterface for why.
     """
 
-    def __init__(self):
+    def __init__(self, engagement=None):
         try:
             import pyaudio  # noqa: F401
         except ImportError as e:
@@ -45,6 +48,12 @@ class AdaptiveDefaultAudioInterface(AudioInterface):
             raise ImportError("AdaptiveDefaultAudioInterface needs soxr — pip install soxr") from e
         self._stop_lock = threading.Lock()
         self._stopped = False
+        # The gate is what makes Nova ignore breaths, sneezes, side
+        # chatter, and her own speaker echo. Constructed eagerly so the
+        # noise-floor calibration starts on the first frame, not on the
+        # first frame *after* an initial burst of audio we'd otherwise
+        # ship straight to ElevenLabs.
+        self._gate = SpeechGate(engagement=engagement)
 
     def _probe_supported_rate(self, p, device_index, is_input: bool) -> int:
         import pyaudio
@@ -116,16 +125,43 @@ class AdaptiveDefaultAudioInterface(AudioInterface):
         import pyaudio
         try:
             if self.input_rate == SDK_RATE:
-                self.input_callback(in_data)
+                pcm_16k = in_data
             else:
                 samples = np.frombuffer(in_data, dtype=np.int16)
                 resampled = self._soxr.resample(samples, self.input_rate, SDK_RATE)
-                self.input_callback(resampled.astype(np.int16).tobytes())
+                pcm_16k = resampled.astype(np.int16).tobytes()
+            # SpeechGate filters out non-speech, near-silence, breath
+            # bursts, side conversations, and Nova's own speaker echo
+            # — yielding only the 20 ms frames that look like real
+            # engaged speech. Anything not yielded simply never reaches
+            # ElevenLabs, so the server-side VAD never sees it.
+            for chunk in self._gate.feed(pcm_16k):
+                self.input_callback(chunk)
         except Exception as e:
             print(f"[AUDIO] in_callback error (ignored): {type(e).__name__}: {e}")
         return (None, pyaudio.paContinue)
 
+    @property
+    def gate(self) -> SpeechGate:
+        return self._gate
+
     def output(self, audio: bytes):
+        # Tell the gate Nova just produced speaker audio. The gate uses
+        # this to switch to the stricter barge-in threshold (1.5 s of
+        # clear speech required to interrupt) instead of the idle one
+        # (250 ms — fine when she's silent). Without this, a breath
+        # during her sentence would cut her off.
+        self._gate.notify_agent_output()
+        # Track downstream bandwidth + first-audio latency. Both feed
+        # the [NET] log line. note_first_audio_chunk only fires for
+        # the first chunk after each user_transcript — the lifecycle
+        # thread arms it via NetStats.note_user_transcript().
+        try:
+            ns = get_net_stats()
+            ns.note_downstream_bytes(len(audio))
+            ns.note_first_audio_chunk()
+        except Exception:
+            pass
         self.output_queue.put(audio)
 
     def interrupt(self):

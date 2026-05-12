@@ -28,18 +28,28 @@ DETECT_SCALE = 0.5
 # {"unknown": True, "low_quality": True} so the presence tracker still
 # accumulates time toward publishing face_unknown, but the embedding+match
 # path is skipped on bad frames.
-# Tuned per platform: Pi camera optics are sharper and tend to fill more
-# of the frame, so we can be stricter. Laptop webcams are softer.
+#
+# Loosened for the robot use case (May 2026): the Pi sits on a moving
+# platform, not on a fixed kiosk, so we have to recognize people at
+# arm's length AND from across the room, with their heads turned
+# wherever the conversation is going. The old strict-Pi tuning required
+# users to be within ~1 m and looking straight at the camera, which is
+# not realistic for a robot wandering past someone in a hallway.
+#
+# Detection now runs on 480x360 (see VisionPipeline) instead of 320x240,
+# so a 40-px face here is ~85 px in the source frame — recognizable at
+# ~2-2.5 m with most USB webcams. MAX_POSE_ASYM 0.55 allows ~30° of
+# head turn before we reject — about the angle of a casual glance.
 if IS_PI:
-    MIN_FACE_PX = 60
-    MIN_DETECT_SCORE = 0.80
-    MIN_BLUR_VAR = 60.0
-    MAX_POSE_ASYM = 0.40
-else:
     MIN_FACE_PX = 40
-    MIN_DETECT_SCORE = 0.70
-    MIN_BLUR_VAR = 30.0
-    MAX_POSE_ASYM = 0.50
+    MIN_DETECT_SCORE = 0.72
+    MIN_BLUR_VAR = 40.0
+    MAX_POSE_ASYM = 0.55
+else:
+    MIN_FACE_PX = 35
+    MIN_DETECT_SCORE = 0.68
+    MIN_BLUR_VAR = 25.0
+    MAX_POSE_ASYM = 0.60
 
 print(f"[FACE] Platform: {_platform_describe()} → "
       f"quality gate (face_px>{MIN_FACE_PX}, score>{MIN_DETECT_SCORE}, "
@@ -60,7 +70,9 @@ def _face_quality_ok(face: dict, image: np.ndarray) -> tuple[bool, str]:
         return False, "empty_crop"
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    # CV_32F instead of CV_64F: half the memory bandwidth on ARM, identical
+    # variance to ~6 significant figures — well past what the threshold cares about.
+    blur_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
     if blur_var < MIN_BLUR_VAR:
         return False, f"blurry(var={blur_var:.0f})"
 
@@ -138,11 +150,31 @@ class FaceRecognitionBridge:
         # models_ready is False, so SFace can take its 3 minutes to download
         # over slow Pi internet without blocking anything else.
         self._models_ready = threading.Event()
+        # In-memory cache of the embeddings matrix. Without this, every
+        # recognize call reads the JSON from disk inside the locked
+        # critical section — small but real (~5-10 ms on a Pi 4) and
+        # unnecessary because the matrix only changes when we
+        # register or delete an identity.
+        self._matrix_cache: tuple | None = None
+        self._matrix_cache_lock = threading.Lock()
         threading.Thread(
             target=self._validate_models_bg,
             daemon=True,
             name="face-models-init",
         ).start()
+
+    def _load_matrix_cached(self):
+        """Return (matrix, ids), reading from disk only the first time
+        after a register/delete invalidation. Thread-safe — concurrent
+        callers will all see the same cached tuple."""
+        with self._matrix_cache_lock:
+            if self._matrix_cache is None:
+                self._matrix_cache = self.system.storage.load_matrix()
+            return self._matrix_cache
+
+    def _invalidate_matrix_cache(self):
+        with self._matrix_cache_lock:
+            self._matrix_cache = None
 
     @property
     def models_ready(self) -> bool:
@@ -278,7 +310,7 @@ class FaceRecognitionBridge:
                     return {"unknown": True, "face_bbox": face["bbox"], "low_quality": True}
                 self._last_reject = ""
                 embedding = generate_embedding(small, face["raw"])
-                matrix, ids = self.system.storage.load_matrix()
+                matrix, ids = self._load_matrix_cached()
                 if matrix is None:
                     return {"unknown": True, "face_bbox": face["bbox"]}
                 match = find_best_match(embedding, matrix, ids, THRESHOLD)
@@ -315,49 +347,82 @@ class FaceRecognitionBridge:
                 faces = detect_faces(small)
                 if not faces:
                     return []
-                matrix, ids = self.system.storage.load_matrix()
-                results: list[dict] = []
-                for face in faces:
-                    ok, why = _face_quality_ok(face, small)
-                    if not ok:
-                        continue
-                    embedding = generate_embedding(small, face["raw"])
-                    if matrix is None:
-                        results.append({"unknown": True, "face_bbox": face["bbox"]})
-                        continue
-                    match = find_best_match(embedding, matrix, ids, THRESHOLD)
-                    if not match:
-                        results.append({"unknown": True, "face_bbox": face["bbox"]})
-                        continue
-                    meta = self.system.storage.get_metadata(match["id"]) or {}
-                    results.append({
-                        "id": match["id"],
-                        "name": meta.get("name", "unknown"),
-                        "confidence": match["confidence"],
-                        "face_bbox": face["bbox"],
-                        "unknown": False,
-                    })
-                return results
+                return self._recognize_in_locked(small, faces)
             except Exception as e:
                 print(f"[FACE] recognize_all() exception: {type(e).__name__}: {e}")
                 return []
 
+    def recognize_in(self, image: np.ndarray, faces: list[dict]) -> list[dict]:
+        """Recognize a *pre-detected* set of faces.
+
+        Used by VisionPipeline so we don't pay for detection twice (once
+        for the live preview at 6 Hz, again for recognition at 2 Hz).
+        The caller is responsible for passing the same `image` that the
+        bboxes were produced from — otherwise SFace will embed the wrong
+        crop and we'll get garbage matches."""
+        if not self._models_ready.is_set() or not faces:
+            return []
+        with self._recog_lock:
+            try:
+                return self._recognize_in_locked(image, faces)
+            except Exception as e:
+                print(f"[FACE] recognize_in() exception: {type(e).__name__}: {e}")
+                return []
+
+    def _recognize_in_locked(self, image: np.ndarray, faces: list[dict]) -> list[dict]:
+        matrix, ids = self._load_matrix_cached()
+        results: list[dict] = []
+        for face in faces:
+            ok, why = _face_quality_ok(face, image)
+            if not ok:
+                continue
+            embedding = generate_embedding(image, face["raw"])
+            if matrix is None:
+                results.append({"unknown": True, "face_bbox": face["bbox"]})
+                continue
+            match = find_best_match(embedding, matrix, ids, THRESHOLD)
+            if not match:
+                results.append({"unknown": True, "face_bbox": face["bbox"]})
+                continue
+            meta = self.system.storage.get_metadata(match["id"]) or {}
+            results.append({
+                "id": match["id"],
+                "name": meta.get("name", "unknown"),
+                "confidence": match["confidence"],
+                "face_bbox": face["bbox"],
+                "unknown": False,
+            })
+        return results
+
     def register(self, image: np.ndarray, name: str) -> dict | None:
         with self._recog_lock:
             try:
-                return self.system.register(image, {"name": name})
+                result = self.system.register(image, {"name": name})
+                self._invalidate_matrix_cache()
+                return result
             except Exception:
                 return None
 
-    def register_multi(self, frames: list[np.ndarray], name: str) -> dict | None:
+    def register_multi(self, frames: list[np.ndarray], name: str) -> dict:
+        """Average N face embeddings into one identity.
+
+        Always returns a dict with at least `ok` and `rejects` so the
+        caller can produce a useful error message — the old "return None"
+        path lost all diagnostic info and made the agent's failure reply
+        generic ("I couldn't get a clear look at you").
+
+        Returns:
+          {"ok": True, "id": str, "samples_used": int, "rejects": list[str]}  on success
+          {"ok": False, "samples_used": int, "rejects": list[str]}             on failure
+        """
         if not frames:
-            return None
+            return {"ok": False, "samples_used": 0, "rejects": ["no_frames"]}
         if not self._models_ready.is_set():
-            return None
+            return {"ok": False, "samples_used": 0, "rejects": ["models_not_ready"]}
         with self._recog_lock:
             try:
                 embeddings = []
-                rejects = []
+                rejects: list[str] = []
                 for frame in frames:
                     small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE) \
                         if frame.shape[1] > 320 else frame
@@ -382,20 +447,33 @@ class FaceRecognitionBridge:
                       f"(rejects: {rejects[:5]})")
 
                 if len(embeddings) < 2:
-                    return None
+                    return {"ok": False, "samples_used": len(embeddings), "rejects": rejects}
 
                 stacked = np.stack(embeddings)
                 averaged = stacked.mean(axis=0)
                 averaged = averaged / float(np.linalg.norm(averaged))
 
                 identity_id = self.system.storage.save(averaged, {"name": name})
-                return {"id": identity_id, "status": "registered", "samples_used": len(embeddings)}
+                self._invalidate_matrix_cache()
+                return {
+                    "ok": True,
+                    "id": identity_id,
+                    "samples_used": len(embeddings),
+                    "rejects": rejects,
+                }
             except Exception as e:
                 print(f"[FACE] register_multi failed: {e}")
-                return None
+                return {
+                    "ok": False,
+                    "samples_used": 0,
+                    "rejects": [f"exception:{type(e).__name__}"],
+                }
 
     def delete(self, identity_id: str) -> bool:
-        return self.system.delete(identity_id)
+        result = self.system.delete(identity_id)
+        if result:
+            self._invalidate_matrix_cache()
+        return result
 
     def list_identities(self) -> dict:
         return self.system.list_identities()

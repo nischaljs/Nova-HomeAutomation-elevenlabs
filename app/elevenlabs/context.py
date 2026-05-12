@@ -2,6 +2,61 @@ from app.face.context import build_face_context, build_unknown_context
 from app.face.person_memory import get_memory
 
 
+# Confidence bands. The face matcher's threshold is 0.40 so anything we
+# get back has at least that. Above 0.65 we're very sure — greet by name
+# the way you'd greet a friend. Between 0.55 and 0.65 we're confident but
+# leave a tiny opening for a polite "is that you?". Below 0.55 we ask a
+# soft yes/no first so the visitor can correct us before Nova commits to
+# a name. These ratios are deliberately conservative — getting someone's
+# name wrong is a much worse error than asking once.
+CONF_VERY_SURE = 0.65
+CONF_LIKELY = 0.55
+
+# Per-band directives passed *into the context update*. ElevenLabs'
+# system prompt already says "match the user's language", so these are
+# written as instructions to the LLM (it translates) rather than as
+# scripted Nepali/English greetings.
+_BAND_DIRECTIVE = {
+    "very_sure": (
+        " You're confident this is them — greet them by name warmly, "
+        "no hedging."
+    ),
+    "likely": (
+        " You're confident but not 100% — greet them by name and "
+        "naturally check, like '<Name>, right?' Don't sound robotic, "
+        "just a tiny human check-in."
+    ),
+    "guess": (
+        " You're not fully sure it's them — start with a soft yes/no "
+        "check, like 'You look like <Name> — am I right?' or "
+        "'तपाईं <Name> हो कि?' so they can correct you if it's not them. "
+        "Don't say 'my system thinks' or anything technical — just be a "
+        "person who isn't quite sure."
+    ),
+}
+
+
+def _confidence_band(conf: float) -> str:
+    if conf >= CONF_VERY_SURE:
+        return "very_sure"
+    if conf >= CONF_LIKELY:
+        return "likely"
+    return "guess"
+
+
+def _band_directive(known: list[dict]) -> str:
+    """Pick the *least* confident person's band for the whole-scene
+    directive — if any one of them is a guess, Nova should soften her
+    greeting; calling one known visitor confidently and one tentatively
+    in the same sentence is weirder than just being gentle with both."""
+    if not known:
+        return ""
+    weakest = min(_confidence_band(p.get("confidence", 0)) for p in known)
+    # min() over strings: 'guess' < 'likely' < 'very_sure' alphabetically,
+    # which is exactly the "weakest band wins" order we want.
+    return _BAND_DIRECTIVE.get(weakest, "")
+
+
 def face_info_to_context_text(face_info: dict | None) -> str:
     if face_info is None:
         return "The visitor has left. You can return to idle."
@@ -17,7 +72,12 @@ def face_info_to_context_text(face_info: dict | None) -> str:
     if not base:
         return ""
 
-    return base + " Greet them by name in your next turn. Keep it warm and brief."
+    band = _confidence_band(face_info.get("confidence", 0))
+    return (
+        base
+        + " Greet them by name in your next turn. Keep it warm and brief."
+        + _BAND_DIRECTIVE[band]
+    )
 
 
 def face_state_to_context_text(state: dict) -> str:
@@ -39,6 +99,7 @@ def face_state_to_context_text(state: dict) -> str:
         face_id = person.get("id")
         name = person.get("name", "unknown")
         conf = person.get("confidence", 0)
+        band = _confidence_band(conf)
         m = mem.get(face_id, name) if face_id else {}
         parts = [name]
         if m.get("visit_count", 0) > 1:
@@ -53,12 +114,13 @@ def face_state_to_context_text(state: dict) -> str:
                 if len(snippet) > 80:
                     snippet = snippet[:77] + "…"
                 parts.append(f'last said: "{snippet}"')
-        described.append(" — ".join(parts) + f" (match {conf:.0%})")
+        described.append(" — ".join(parts) + f" (match {conf:.0%} — {band})")
 
     if n_known == 1 and unknown_count == 0:
         return (
             f"The person in front of you is {described[0]}. "
             "Greet them by name in your next turn. Keep it warm and brief."
+            + _band_directive(known)
         )
 
     if n_known == 0 and unknown_count == 1:
@@ -85,6 +147,7 @@ def face_state_to_context_text(state: dict) -> str:
             f"{n_known} known visitors are here together: {who}. "
             f"Greet them both by name like you're saying hi to a pair of friends "
             f"who walked up together. Don't repeat any context aloud — just be natural."
+            + _band_directive(known)
         )
 
     if n_known >= 1 and unknown_count >= 1:
@@ -113,6 +176,7 @@ def face_state_to_context_text(state: dict) -> str:
             f"{known_phrase} {verb} here, and {unknown_phrase}. "
             f"Greet the known {greet_target} by name and warmly welcome the new visitor(s)."
             + register_rule
+            + _band_directive(known)
         )
 
     return ""

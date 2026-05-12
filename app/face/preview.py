@@ -6,16 +6,10 @@ import cv2
 
 from app.face.face_tools import FrameBuffer
 
-from face_recognition_system.detector import detect_faces
-
 GREEN = (0, 220, 0)
 RED = (0, 60, 240)
 YELLOW = (0, 200, 255)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-DETECT_SCALE = 0.5
-SCALE_BACK = 1 / DETECT_SCALE
-DETECT_INTERVAL_S = 0.15
 
 # Cap preview at ~30 FPS — the camera + Qt imshow path was spinning at
 # 80–100 FPS on the Pi, burning CPU that should go to face recognition.
@@ -29,20 +23,52 @@ TARGET_FRAME_INTERVAL_S = 1.0 / TARGET_FPS
 LABEL_HOLD_S = 3.0
 
 
+def _display_available() -> bool:
+    """True when a display server is actually reachable.
+
+    On headless Pi neither DISPLAY nor WAYLAND_DISPLAY is set, and trying
+    to open a Qt window aborts the whole process. Checking both env vars
+    is the cheapest pre-check. NOVA_HEADLESS=1 forces disabled even when
+    a display exists (useful in systemd units that inherit DISPLAY but
+    don't actually have one).
+    """
+    if os.environ.get("NOVA_HEADLESS") == "1":
+        return False
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 class CameraPreview:
+    """Debug preview window. Consumes LatestVision — no detection of its own.
+
+    Previously this class ran a parallel detector at ~6 Hz so it could
+    draw bounding boxes. That doubled the detection cost on the Pi for
+    no benefit (the FaceMonitor needs the same boxes). After the
+    VisionPipeline refactor, the preview just reads detected boxes from
+    LatestVision and overlays them on the live camera frame.
+    """
+
     def __init__(self, window_name="Nova Camera"):
         self._window_name = window_name
         self._running = False
         self._thread = None
         self._faces_by_id: dict[str, dict] = {}
+        self._raw_boxes: list[dict] = []
+        self._scale_to_source: float = 1.0
         self._lock = threading.Lock()
         self._fps = 0.0
-        self._enabled = os.environ.get("NOVA_DEBUG", "1") == "1"
+        wants_preview = os.environ.get("NOVA_DEBUG", "1") == "1"
+        self._enabled = wants_preview and _display_available()
+        self._gui_dead = False
 
-    def update_faces(self, recognized: list[dict]):
-        """List of recognize_all() results — one entry per detected face."""
+    def update_faces(self, faces_raw: list[dict], recognized: list[dict],
+                     scale_to_source: float):
+        """Push the latest vision snapshot. Called by FaceMonitor's poll
+        loop — same data the recognizer just consumed, so the labels and
+        boxes are guaranteed to be in sync."""
         now = time.time()
         with self._lock:
+            self._raw_boxes = faces_raw or []
+            self._scale_to_source = scale_to_source
             for f in recognized or []:
                 if f.get("unknown") or not f.get("name") or not f.get("id"):
                     continue
@@ -54,8 +80,7 @@ class CameraPreview:
                     "last_seen": now,
                 }
             stale = [
-                fid
-                for fid, info in self._faces_by_id.items()
+                fid for fid, info in self._faces_by_id.items()
                 if now - info["last_seen"] > LABEL_HOLD_S
             ]
             for fid in stale:
@@ -63,7 +88,12 @@ class CameraPreview:
 
     def start(self):
         if not self._enabled:
-            print("[PREVIEW] Disabled (NOVA_DEBUG=0)")
+            reason = (
+                "NOVA_HEADLESS=1" if os.environ.get("NOVA_HEADLESS") == "1"
+                else "no DISPLAY/WAYLAND_DISPLAY" if not _display_available()
+                else "NOVA_DEBUG=0"
+            )
+            print(f"[PREVIEW] Disabled ({reason})")
             return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -72,20 +102,18 @@ class CameraPreview:
 
     def stop(self):
         self._running = False
-        if self._enabled:
-            cv2.destroyAllWindows()
+        if self._enabled and not self._gui_dead:
+            try:
+                cv2.destroyAllWindows()
+            except Exception as e:
+                print(f"[PREVIEW] destroyAllWindows failed (ignored): {type(e).__name__}: {e}")
         print("[PREVIEW] Stopped")
-
-    def _detect(self, frame):
-        try:
-            small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
-            return detect_faces(small) or []
-        except Exception:
-            return []
 
     def _match_label(self, det_bbox):
         """Find the recognized face whose stored bbox is closest to det_bbox.
-        Returns (label_text, color)."""
+        Returns (label_text, color). bbox here is already in *detection*
+        coordinates (480×360), as is every stored face_bbox.
+        """
         if det_bbox is None:
             return "UNKNOWN", RED
 
@@ -114,14 +142,14 @@ class CameraPreview:
             return f"{name} {conf:.0%}", GREEN
         return "UNKNOWN", RED
 
-    def _draw_box(self, display, bbox, text, color):
+    def _draw_box(self, display, bbox, text, color, scale):
         try:
             if bbox is None or len(bbox) < 4:
                 return
-            x = int(float(bbox[0]) * SCALE_BACK)
-            y = int(float(bbox[1]) * SCALE_BACK)
-            w = int(float(bbox[2]) * SCALE_BACK)
-            h = int(float(bbox[3]) * SCALE_BACK)
+            x = int(float(bbox[0]) * scale)
+            y = int(float(bbox[1]) * scale)
+            w = int(float(bbox[2]) * scale)
+            h = int(float(bbox[3]) * scale)
             pt1 = (x, y)
             pt2 = (x + w, y + h)
             cv2.rectangle(display, pt1, pt2, color, 2)
@@ -129,15 +157,12 @@ class CameraPreview:
             cv2.rectangle(display, (x, max(0, y - th - 8)), (x + tw + 4, y), color, -1)
             cv2.putText(display, text, (x + 2, max(th, y - 4)), FONT, 0.65, (255, 255, 255), 2)
         except Exception as e:
-            # One malformed bbox shouldn't kill the whole preview thread
             print(f"[PREVIEW] draw_box error (ignored): {type(e).__name__}: {e}")
 
     def _loop(self):
         fb = FrameBuffer()
         t_fps = time.time()
         frame_count = 0
-        last_detect = 0.0
-        cached_faces: list = []
 
         print("[PREVIEW] Loop started")
 
@@ -152,34 +177,42 @@ class CameraPreview:
                 display = frame.copy()
                 now = time.time()
 
-                if now - last_detect >= DETECT_INTERVAL_S:
-                    cached_faces = self._detect(frame)
-                    last_detect = now
+                with self._lock:
+                    raw = list(self._raw_boxes)
+                    scale = self._scale_to_source
 
-                for f in cached_faces:
+                for f in raw:
                     bbox = f.get("bbox")
                     if bbox is None:
                         continue
                     text, color = self._match_label(bbox)
-                    self._draw_box(display, bbox, text, color)
+                    self._draw_box(display, bbox, text, color, scale)
 
                 if frame_count % 30 == 0:
                     self._fps = 30 / max(now - t_fps, 0.001)
                     t_fps = now
                     if frame_count % 300 == 0:
-                        print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces={len(cached_faces)}")
+                        print(f"[PREVIEW] FPS={self._fps:.0f} frame={frame_count} faces={len(raw)}")
 
                 cv2.putText(display, f"FPS {self._fps:.0f}", (8, 22), FONT, 0.6, (200, 200, 200), 1)
-                cv2.imshow(self._window_name, display)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    print("[PREVIEW] User pressed 'q' — stopping")
+                try:
+                    cv2.imshow(self._window_name, display)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("[PREVIEW] User pressed 'q' — stopping")
+                        break
+                except cv2.error as e:
+                    # No display reachable (Qt couldn't open a window).
+                    # Switch off permanently rather than spam errors every
+                    # frame; the rest of Nova keeps running fine headless.
+                    print(f"[PREVIEW] imshow failed — disabling preview "
+                          f"({type(e).__name__}: {e})")
+                    self._gui_dead = True
+                    self._running = False
                     break
 
-                # Cap frame rate to TARGET_FPS so we don't hog the CPU
                 sleep_time = TARGET_FRAME_INTERVAL_S - (time.time() - now)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
             except Exception as e:
-                # Never let the preview thread die — log and continue
                 print(f"[PREVIEW] loop error (ignored): {type(e).__name__}: {e}")
                 time.sleep(0.1)

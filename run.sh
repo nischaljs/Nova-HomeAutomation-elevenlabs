@@ -59,4 +59,14 @@ fi
 
 # ── 4. Launch ─────────────────────────────────────────────────────────────
 export PYTHONUNBUFFERED=1
+
+# Auto-detect headless. On a Pi running as a robot/kiosk there's no
+# monitor, so DISPLAY and WAYLAND_DISPLAY are both empty. Without this,
+# the preview thread's cv2.imshow aborts the process before the agent
+# can come up.
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+  export NOVA_HEADLESS=1
+  echo "[run.sh] No display server detected — running headless (NOVA_HEADLESS=1)"
+fi
+
 exec python -m app.main 2>&1 | tee /tmp/nova-run.log
