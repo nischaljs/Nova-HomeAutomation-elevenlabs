@@ -22,7 +22,16 @@ from app.platform_detect import IS_PI, describe as _platform_describe
 
 DATA_DIR = os.path.join(FACE_RECO_PATH, "face_data")
 THRESHOLD = 0.40
-DETECT_SCALE = 0.5
+
+# Every detect/recognize/register path in this module resizes the source
+# frame to this resolution before handing it to YuNet. Matches what
+# VisionPipeline already uses for the live detect loop, so a face that
+# looks N pixels wide here looks N pixels wide there — embeddings from
+# registration and embeddings from live recognition are produced from
+# pixel-equivalent crops, which is required for the cosine matcher to
+# behave consistently.
+DETECT_TARGET_W = int(os.environ.get("NOVA_DETECT_W", "480"))
+DETECT_TARGET_H = int(os.environ.get("NOVA_DETECT_H", "360"))
 
 # Quality gate thresholds — frames failing any of these are returned as
 # {"unknown": True, "low_quality": True} so the presence tracker still
@@ -36,10 +45,10 @@ DETECT_SCALE = 0.5
 # users to be within ~1 m and looking straight at the camera, which is
 # not realistic for a robot wandering past someone in a hallway.
 #
-# Detection now runs on 480x360 (see VisionPipeline) instead of 320x240,
-# so a 40-px face here is ~85 px in the source frame — recognizable at
-# ~2-2.5 m with most USB webcams. MAX_POSE_ASYM 0.55 allows ~30° of
-# head turn before we reject — about the angle of a casual glance.
+# At DETECT_TARGET_W=480 a 40-px face here is ~85 px in a 640-wide
+# source — recognizable at ~2–2.5 m with most USB webcams. MAX_POSE_ASYM
+# 0.55 allows ~30° of head turn before we reject — about the angle of
+# a casual glance.
 if IS_PI:
     MIN_FACE_PX = 40
     MIN_DETECT_SCORE = 0.72
@@ -51,9 +60,71 @@ else:
     MIN_BLUR_VAR = 25.0
     MAX_POSE_ASYM = 0.60
 
+# Sun / overexposure handling. A face crop that's mostly blown-out white
+# has a very low Laplacian variance not because it's motion-blurred but
+# because there's nothing for the kernel to find in a saturated region.
+# When the crop's median pixel is above BRIGHT_MEDIAN_PX (≈ 82 % gray)
+# we drop the blur floor to BRIGHT_BLUR_VAR_MIN — enough to still reject
+# truly featureless frames but not so high that a real outdoor face
+# gets thrown away. Reject reason still records the median brightness
+# so a 'sun mode' acceptance is distinguishable in logs.
+BRIGHT_MEDIAN_PX = 210.0
+BRIGHT_BLUR_VAR_MIN = 8.0
+
+# Burst-and-rank registration. With dedup'd capture giving ~25-30 unique
+# camera frames in 3.5s, we score every quality-gate-pass frame and only
+# embed the top REGISTER_KEEP_TOP — embeddings on a Pi are the expensive
+# part (~80 ms each), so doing fewer + better ones is strictly better
+# than averaging many noisy ones. Score normalizers are heuristic, not
+# ML-trained — they just need to be monotonic (bigger face / sharper /
+# more frontal / higher detection confidence = higher score).
+REGISTER_KEEP_TOP = int(os.environ.get("NOVA_REGISTER_KEEP_TOP", "12"))
+SCORE_FACE_PX_NORM = 120.0   # face width at which size factor saturates to 1
+SCORE_BLUR_NORM = 120.0      # Laplacian variance at which blur factor saturates
+
+
+def _frame_score(face: dict, image: np.ndarray) -> tuple[float, dict]:
+    """Score in [0, 1] for ranking quality-gate-passing frames before
+    embedding. Returns (score, breakdown) — breakdown is logged so the
+    user can see *why* one frame outranked another.
+    """
+    x, y, w, h = face["bbox"]
+    det = float(face.get("score", 0.0))
+    size = min(float(w) / SCORE_FACE_PX_NORM, 1.0)
+
+    asym_factor = 1.0
+    landmarks = face.get("landmarks")
+    if landmarks is not None and len(landmarks) >= 3:
+        right_eye, left_eye, nose = landmarks[0], landmarks[1], landmarks[2]
+        d_r = abs(float(right_eye[0]) - float(nose[0]))
+        d_l = abs(float(left_eye[0]) - float(nose[0]))
+        max_d = max(d_r, d_l)
+        if max_d > 0:
+            asym = abs(d_r - d_l) / max_d
+            asym_factor = max(0.0, 1.0 - asym)
+
+    x0, y0 = max(0, x), max(0, y)
+    crop = image[y0:y0 + h, x0:x0 + w]
+    if crop.size == 0:
+        blur_factor = 0.0
+    else:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blur_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+        blur_factor = min(blur_var / SCORE_BLUR_NORM, 1.0)
+
+    score = det * size * asym_factor * blur_factor
+    return score, {
+        "det": round(det, 2),
+        "size": round(size, 2),
+        "front": round(asym_factor, 2),
+        "sharp": round(blur_factor, 2),
+    }
+
 print(f"[FACE] Platform: {_platform_describe()} → "
+      f"detect target {DETECT_TARGET_W}x{DETECT_TARGET_H}, "
       f"quality gate (face_px>{MIN_FACE_PX}, score>{MIN_DETECT_SCORE}, "
-      f"blur>{MIN_BLUR_VAR}, asym<{MAX_POSE_ASYM})")
+      f"blur>{MIN_BLUR_VAR} [sun-relaxed to {BRIGHT_BLUR_VAR_MIN} "
+      f"when med>{BRIGHT_MEDIAN_PX:.0f}], asym<{MAX_POSE_ASYM})")
 
 
 def _face_quality_ok(face: dict, image: np.ndarray) -> tuple[bool, str]:
@@ -74,7 +145,12 @@ def _face_quality_ok(face: dict, image: np.ndarray) -> tuple[bool, str]:
     # variance to ~6 significant figures — well past what the threshold cares about.
     blur_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
     if blur_var < MIN_BLUR_VAR:
-        return False, f"blurry(var={blur_var:.0f})"
+        # Sun / overexposure escape hatch — see BRIGHT_MEDIAN_PX comment
+        # at the top of the file.
+        median_brightness = float(np.median(gray))
+        if not (median_brightness >= BRIGHT_MEDIAN_PX
+                and blur_var >= BRIGHT_BLUR_VAR_MIN):
+            return False, f"blurry(var={blur_var:.0f},med={median_brightness:.0f})"
 
     landmarks = face.get("landmarks")
     if landmarks is not None and len(landmarks) >= 3:
@@ -88,6 +164,78 @@ def _face_quality_ok(face: dict, image: np.ndarray) -> tuple[bool, str]:
                 return False, f"off_axis(asym={asym:.2f})"
 
     return True, ""
+
+
+def _resize_for_detection(image: np.ndarray) -> tuple[np.ndarray, float]:
+    """Resize an incoming camera frame to (DETECT_TARGET_W, DETECT_TARGET_H)
+    so every YuNet call in this module sees the same pixels regardless
+    of the source (Picamera2, USB webcam at 640×480, downloaded test
+    image). That makes MIN_FACE_PX mean a consistent distance from the
+    camera and keeps registration embeddings pixel-equivalent to
+    live-recognition embeddings.
+
+    Returns (small, scale_to_source) — the multiplier maps a bbox in
+    the small frame back to source coordinates if a caller needs it.
+    """
+    src_h, src_w = image.shape[:2]
+    if src_w == DETECT_TARGET_W and src_h == DETECT_TARGET_H:
+        return image, 1.0
+    small = cv2.resize(image, (DETECT_TARGET_W, DETECT_TARGET_H))
+    return small, src_w / float(DETECT_TARGET_W)
+
+
+def _pick_primary_face(faces: list[dict]) -> dict | None:
+    """In a crowd/family/outdoor scene, the largest-area bbox is the
+    person closest to the camera — i.e. the one engaging the robot.
+    Taking faces[0] (YuNet's arbitrary first) registers / recognizes the
+    wrong person whenever a stranger is incidentally in frame.
+    """
+    if not faces:
+        return None
+    return max(faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
+
+
+def _save_per_photo_artifacts(
+    storage,
+    identity_id: str,
+    usable: list[tuple[np.ndarray, dict, np.ndarray]],
+) -> int:
+    """Persist one JPEG thumbnail + one per-photo .npy embedding under
+    face_data/photos/<identity_id>/ for every usable frame from a
+    successful registration. The /setup UI reads these to render
+    thumbnails and to re-average the identity when the user adds or
+    removes photos. Best-effort — registration succeeds even if this
+    fails. Returns the count actually written.
+    """
+    if not usable:
+        return 0
+    import uuid
+    photos_dir = storage.embeddings_dir.parent / "photos" / identity_id
+    try:
+        photos_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[FACE] photos: mkdir failed for {photos_dir}: {e} (skipping)")
+        return 0
+    written = 0
+    for small, face, emb in usable:
+        x, y, w, h = face["bbox"]
+        x0, y0 = max(0, x), max(0, y)
+        crop = small[y0:y0 + h, x0:x0 + w]
+        if crop.size == 0:
+            continue
+        try:
+            thumb = cv2.resize(crop, (256, 256))
+        except cv2.error:
+            continue
+        photo_id = uuid.uuid4().hex
+        try:
+            cv2.imwrite(str(photos_dir / f"{photo_id}.jpg"), thumb,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            np.save(photos_dir / f"{photo_id}.npy", emb)
+            written += 1
+        except OSError as e:
+            print(f"[FACE] photos: write failed for {photo_id}: {e} (skipping)")
+    return written
 
 
 class FrameBuffer:
@@ -290,18 +438,20 @@ class FaceRecognitionBridge:
         print("[FACE] all models ready")
 
     def has_face(self, image: np.ndarray) -> bool:
-        small = cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if image.shape[1] > 320 else image
+        small, _ = _resize_for_detection(image)
         faces = detect_faces(small)
         return len(faces) > 0
 
     def recognize(self, image: np.ndarray) -> dict | None:
         with self._recog_lock:
             try:
-                small = cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if image.shape[1] > 320 else image
+                small, _ = _resize_for_detection(image)
                 faces = detect_faces(small)
                 if not faces:
                     return None
-                face = faces[0]
+                # Pick the largest face — closest to camera, most likely
+                # the engaged user (see _pick_primary_face).
+                face = _pick_primary_face(faces)
                 ok, why = _face_quality_ok(face, small)
                 if not ok:
                     if not getattr(self, "_last_reject", "") == why:
@@ -339,11 +489,7 @@ class FaceRecognitionBridge:
             return []
         with self._recog_lock:
             try:
-                small = (
-                    cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
-                    if image.shape[1] > 320
-                    else image
-                )
+                small, _ = _resize_for_detection(image)
                 faces = detect_faces(small)
                 if not faces:
                     return []
@@ -421,30 +567,62 @@ class FaceRecognitionBridge:
             return {"ok": False, "samples_used": 0, "rejects": ["models_not_ready"]}
         with self._recog_lock:
             try:
-                embeddings = []
                 rejects: list[str] = []
+                # Pass 1: detect + quality gate + score every input
+                # frame. Embedding is the expensive part on a Pi (~80 ms
+                # per call vs ~5 ms for detect), so we defer it until
+                # we know which frames are worth embedding. Each
+                # candidate carries the data the embed pass needs
+                # (the small frame and the raw YuNet output) plus the
+                # score we'll rank by.
+                candidates: list[tuple[float, np.ndarray, dict, dict]] = []
                 for frame in frames:
-                    small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE) \
-                        if frame.shape[1] > 320 else frame
+                    small, _ = _resize_for_detection(frame)
                     faces = detect_faces(small)
                     if not faces:
                         rejects.append("no_face")
                         continue
-                    face = faces[0]
+                    face = _pick_primary_face(faces)
                     ok, why = _face_quality_ok(face, small)
                     if not ok:
                         rejects.append(why)
                         continue
+                    score, breakdown = _frame_score(face, small)
+                    candidates.append((score, small, face, breakdown))
+
+                # Pass 2: rank, take top REGISTER_KEEP_TOP, embed only
+                # those. Keeps memory bounded (we don't hold all
+                # candidate frames *and* their embeddings) and burns
+                # the SFace budget on the best samples instead of
+                # averaging in mediocre ones.
+                candidates.sort(key=lambda c: c[0], reverse=True)
+                top = candidates[:REGISTER_KEEP_TOP]
+
+                embeddings: list[np.ndarray] = []
+                usable: list[tuple[np.ndarray, dict, np.ndarray]] = []
+                for score, small, face, _bk in top:
                     emb = generate_embedding(small, face["raw"]).astype(np.float32)
                     n = float(np.linalg.norm(emb))
                     if n <= 0:
                         rejects.append("zero_norm")
                         continue
-                    embeddings.append(emb / n)
+                    emb_norm = emb / n
+                    embeddings.append(emb_norm)
+                    usable.append((small, face, emb_norm))
 
+                # Histogram of reject *reasons* (not the noisy per-frame
+                # detail) is what tells you at a glance what's wrong —
+                # `{'too_small': 5, 'blurry': 1}` vs scrolling 6 strings.
+                reject_summary: dict[str, int] = {}
+                for r in rejects:
+                    key = r.split("(", 1)[0]
+                    reject_summary[key] = reject_summary.get(key, 0) + 1
+
+                top_scores = [round(c[0], 2) for c in top]
                 print(f"[FACE] register_multi('{name}'): "
-                      f"{len(embeddings)} usable / {len(frames)} captured "
-                      f"(rejects: {rejects[:5]})")
+                      f"captured={len(frames)} passed_gate={len(candidates)} "
+                      f"embedded={len(embeddings)} (top {len(top)} scored "
+                      f"{top_scores})  reasons={reject_summary or '{}'}")
 
                 if len(embeddings) < 2:
                     return {"ok": False, "samples_used": len(embeddings), "rejects": rejects}
@@ -455,6 +633,12 @@ class FaceRecognitionBridge:
 
                 identity_id = self.system.storage.save(averaged, {"name": name})
                 self._invalidate_matrix_cache()
+                written = _save_per_photo_artifacts(
+                    self.system.storage, identity_id, usable
+                )
+                if written:
+                    print(f"[FACE] register_multi('{name}'): "
+                          f"saved {written} reference photo(s) for /setup UI")
                 return {
                     "ok": True,
                     "id": identity_id,
@@ -523,19 +707,13 @@ class FaceRecognitionBridge:
             try:
                 # Detect the largest face in the current frame so we
                 # know we have a single, clear subject to reinforce
-                # against. Same DETECT_SCALE the rest of the pipeline
+                # against. Same detect target the rest of the pipeline
                 # uses so coordinates line up.
-                small = (
-                    cv2.resize(image, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
-                    if image.shape[1] > 320
-                    else image
-                )
+                small, _ = _resize_for_detection(image)
                 faces = detect_faces(small) or []
                 if not faces:
                     return {"ok": False, "reason": "no_face_in_frame", "id": identity_id}
-                # Pick the biggest face — most likely the engaged user.
-                faces.sort(key=lambda f: f["bbox"][2] * f["bbox"][3], reverse=True)
-                face = faces[0]
+                face = _pick_primary_face(faces)
                 ok, why = _face_quality_ok(face, small)
                 if not ok:
                     return {"ok": False, "reason": f"quality:{why}", "id": identity_id}
@@ -594,6 +772,62 @@ class FaceRecognitionBridge:
 
     def list_identities(self) -> dict:
         return self.system.list_identities()
+
+    def detect_contamination(
+        self,
+        identity_id: str,
+        z_threshold: float = 2.0,
+    ) -> list[str]:
+        """Flag per-photo embeddings that sit far from this identity's
+        centroid — i.e. probably a different person that got into the
+        record by accident (someone walked into a multi-person frame
+        during register, or a mis-clicked upload in /setup).
+
+        Returns a list of photo_id strings (.npy/.jpg filename stems
+        under face_data/photos/<id>/) that look like outliers. Empty
+        list when the identity is internally consistent or has too few
+        photos to judge.
+
+        Used by the /setup UI to surface a 'review these photos' badge
+        next to suspect identities. Not used by the live recognition
+        path — it's a curation/cleanup tool only.
+        """
+        photos_dir = (
+            self.system.storage.embeddings_dir.parent
+            / "photos"
+            / identity_id
+        )
+        if not photos_dir.exists():
+            return []
+        embs: list[np.ndarray] = []
+        ids: list[str] = []
+        for p in sorted(photos_dir.glob("*.npy")):
+            try:
+                e = np.load(p).astype(np.float32)
+            except (OSError, ValueError):
+                continue
+            n = float(np.linalg.norm(e))
+            if n <= 0:
+                continue
+            embs.append(e / n)
+            ids.append(p.stem)
+        # Need a few samples to have any meaningful distribution. With
+        # 3, one outlier pulls the mean too much to detect itself.
+        if len(embs) < 4:
+            return []
+        M = np.stack(embs)
+        centroid = M.mean(axis=0)
+        centroid = centroid / float(np.linalg.norm(centroid))
+        sims = M @ centroid
+        mean = float(np.mean(sims))
+        std = float(np.std(sims))
+        if std < 1e-4:
+            return []
+        return [
+            ids[i]
+            for i, s in enumerate(sims)
+            if (mean - float(s)) > z_threshold * std
+        ]
 
 
 FACES_BRIDGE = None

@@ -29,8 +29,13 @@ def get_current_subject() -> tuple[str | None, str | None]:
         return _CURRENT_SUBJECT.get("face_id"), _CURRENT_SUBJECT.get("name")
 
 
-REGISTER_DURATION_S = 2.5
-REGISTER_GAP_S = 0.2
+REGISTER_DURATION_S = 3.5
+# Keep a small inter-frame gap (not zero) so the candidate pool has
+# pose diversity — humans drift their head a few degrees every 100 ms.
+# With burst+rank in the bridge selecting the top N by score, more
+# candidates = better selection; cap is determined by camera fps.
+REGISTER_GAP_S = 0.1
+REGISTER_POLL_S = 0.04
 
 
 # The agent matches the visitor's language (Devanagari / Romanized
@@ -143,19 +148,44 @@ def _register_user_impl(parameters: dict) -> str:
     frames = []
     t_end = time.time() + REGISTER_DURATION_S
     last_grab = 0.0
+    last_ts_seen = 0.0
+    # Diagnostics — without these, a "0/6 captured" failure looks
+    # identical whether the camera was healthy (and the user just had a
+    # bad face) or the camera was stuck and we copied the same stale
+    # frame 6 times. Pull both apart in the log.
+    polls = 0
+    unique_camera_frames = 0
     while time.time() < t_end:
+        polls += 1
         now = time.time()
-        if now - last_grab >= REGISTER_GAP_S:
-            frame = fb.get_frame()
-            if frame is not None:
-                frames.append(frame.copy())
-                last_grab = now
-        time.sleep(0.05)
+        frame, ts = fb.get()
+        # Only count a frame as 'new from the camera' if its timestamp
+        # advanced since the last poll — otherwise FrameBuffer is
+        # handing us the same buffer over and over (camera stalled, USB
+        # hiccup, or we're polling faster than the sensor's fps).
+        is_new = frame is not None and ts > last_ts_seen
+        if is_new:
+            unique_camera_frames += 1
+            last_ts_seen = ts
+        # Enforce REGISTER_GAP_S between *kept* frames so the averaged
+        # embedding gets pose diversity (slight head/expression movement
+        # between samples) rather than 30 near-identical frames.
+        if is_new and now - last_grab >= REGISTER_GAP_S:
+            frames.append(frame.copy())
+            last_grab = now
+        time.sleep(REGISTER_POLL_S)
 
     if not frames:
+        cam_fps_est = unique_camera_frames / REGISTER_DURATION_S
+        print(f"[TOOL] register_user '{name}': capture failed — "
+              f"{polls} polls, {unique_camera_frames} unique camera frames "
+              f"(~{cam_fps_est:.1f} fps), 0 kept")
         return "Camera isn't ready yet — try again in a moment."
 
-    print(f"[TOOL] Captured {len(frames)} frames over {REGISTER_DURATION_S}s for '{name}'")
+    cam_fps_est = unique_camera_frames / REGISTER_DURATION_S
+    print(f"[TOOL] register_user '{name}': captured {len(frames)} frames in "
+          f"{REGISTER_DURATION_S}s (polls={polls}, unique={unique_camera_frames}, "
+          f"camera≈{cam_fps_est:.1f} fps)")
     result = bridge.register_multi(frames, name)
     if isinstance(result, dict) and result.get("ok"):
         used = result.get("samples_used", "?")
