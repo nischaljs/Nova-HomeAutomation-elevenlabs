@@ -1,10 +1,20 @@
+import os
 import time
 from dataclasses import dataclass, field
 
 
-STABLE_DETECTION_SECONDS = 2.0
-UNKNOWN_STABLE_SECONDS = 2.0
-FACE_TRULY_LOST_SECONDS = 5.0
+# How long a face_id must be seen continuously before we publish
+# face_recognized (or unknown faces before face_unknown). Bumped from
+# 2.0s to 3.5s for crowded / outdoor deployments where strangers
+# briefly pass through the camera — at 2s a passer-by could trigger a
+# context update to the ElevenLabs conversation about the wrong person.
+# Env override (NOVA_STABLE_DETECTION_S) so the value can be tuned per
+# deployment (kiosk in a quiet room vs robot at a fair) without rebuild.
+# This is the SINGLE source of truth — cooldown_manager.py imports
+# from here so a future change can't silently drift between the two.
+STABLE_DETECTION_SECONDS = float(os.environ.get("NOVA_STABLE_DETECTION_S", "3.5"))
+UNKNOWN_STABLE_SECONDS = float(os.environ.get("NOVA_UNKNOWN_STABLE_S", "3.5"))
+FACE_TRULY_LOST_SECONDS = float(os.environ.get("NOVA_FACE_LOST_S", "5.0"))
 
 
 @dataclass

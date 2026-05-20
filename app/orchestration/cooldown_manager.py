@@ -1,11 +1,18 @@
 import time
 
+# Single source of truth — see face_presence_tracker for the rationale
+# and env-override knobs. Keeping the import here so IdentityCooldown's
+# "stable enough to act on" threshold can never drift from the tracker's
+# "stable enough to publish" threshold.
+from app.face.face_presence_tracker import (
+    STABLE_DETECTION_SECONDS,
+    FACE_TRULY_LOST_SECONDS,
+)
+
 
 GREET_COOLDOWN = 60.0
 UNKNOWN_ONBOARDING_COOLDOWN = 60.0
-STABLE_DETECTION_SECONDS = 2.0
 FACE_LOST_CONFIRM_SECONDS = 2.0
-FACE_TRULY_LOST_SECONDS = 5.0
 POST_PIPELINE_COOLDOWN = 10.0
 MIN_REPUBLISH_INTERVAL = 10.0
 PIPELINE_IDLE_TIMEOUT = 5.0
