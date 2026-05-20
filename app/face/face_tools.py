@@ -184,15 +184,44 @@ def _resize_for_detection(image: np.ndarray) -> tuple[np.ndarray, float]:
     return small, src_w / float(DETECT_TARGET_W)
 
 
-def _pick_primary_face(faces: list[dict]) -> dict | None:
-    """In a crowd/family/outdoor scene, the largest-area bbox is the
-    person closest to the camera — i.e. the one engaging the robot.
-    Taking faces[0] (YuNet's arbitrary first) registers / recognizes the
-    wrong person whenever a stranger is incidentally in frame.
+def _pick_primary_face(
+    faces: list[dict],
+    frame_shape: tuple | None = None,
+) -> dict | None:
+    """In a crowd/family/outdoor scene, pick the face most likely to be
+    the person *engaging* the robot. Default heuristic: largest bbox
+    area (closest to camera). When `frame_shape` is provided, also
+    bias toward the centre of the frame — a person standing in front
+    of Nova is centred; a passer-by at the edge isn't.
+
+    score = area * (1 - CENTER_WEIGHT * normalized_distance_to_center)
+
+    CENTER_WEIGHT 0.4 means an edge face is worth 60 % of its area
+    while a centred face is worth 100 %. Small enough that a
+    significantly larger edge face (e.g. someone standing close on the
+    side) still wins, big enough to break ties between similar-area
+    faces in favour of the centred one. Falls back to pure-area when
+    no frame_shape passed so older call sites stay correct.
     """
     if not faces:
         return None
-    return max(faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
+    if frame_shape is None:
+        return max(faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
+    h_img, w_img = frame_shape[:2]
+    cx, cy = w_img * 0.5, h_img * 0.5
+    max_dist = (cx * cx + cy * cy) ** 0.5
+    CENTER_WEIGHT = 0.4
+
+    def score(f: dict) -> float:
+        x, y, w, h = f["bbox"]
+        area = float(w * h)
+        face_cx = x + w * 0.5
+        face_cy = y + h * 0.5
+        dist = ((face_cx - cx) ** 2 + (face_cy - cy) ** 2) ** 0.5
+        norm_dist = dist / max_dist if max_dist > 0 else 0.0
+        return area * (1.0 - CENTER_WEIGHT * norm_dist)
+
+    return max(faces, key=score)
 
 
 def _crop_face_with_margin(image: np.ndarray, bbox, margin_frac: float = 0.25,
@@ -484,9 +513,9 @@ class FaceRecognitionBridge:
                 faces = detect_faces(small)
                 if not faces:
                     return None
-                # Pick the largest face — closest to camera, most likely
-                # the engaged user (see _pick_primary_face).
-                face = _pick_primary_face(faces)
+                # Pick the largest *and* most-centred face — closest to
+                # camera + engaged with Nova (see _pick_primary_face).
+                face = _pick_primary_face(faces, small.shape)
                 ok, why = _face_quality_ok(face, small)
                 if not ok:
                     if not getattr(self, "_last_reject", "") == why:
@@ -617,7 +646,7 @@ class FaceRecognitionBridge:
                     if not faces:
                         rejects.append("no_face")
                         continue
-                    face = _pick_primary_face(faces)
+                    face = _pick_primary_face(faces, small.shape)
                     ok, why = _face_quality_ok(face, small)
                     if not ok:
                         rejects.append(why)
@@ -748,7 +777,7 @@ class FaceRecognitionBridge:
                 faces = detect_faces(small) or []
                 if not faces:
                     return {"ok": False, "reason": "no_face_in_frame", "id": identity_id}
-                face = _pick_primary_face(faces)
+                face = _pick_primary_face(faces, small.shape)
                 ok, why = _face_quality_ok(face, small)
                 if not ok:
                     return {"ok": False, "reason": f"quality:{why}", "id": identity_id}

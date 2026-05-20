@@ -172,7 +172,7 @@ def _detect_primary_face(image: np.ndarray) -> tuple[dict | None, np.ndarray, st
     faces = detect_faces(small)
     if not faces:
         return None, small, "no_face"
-    face = _pick_primary_face(faces)
+    face = _pick_primary_face(faces, small.shape)
     ok, why = _face_quality_ok(face, small)
     if not ok:
         return None, small, why
