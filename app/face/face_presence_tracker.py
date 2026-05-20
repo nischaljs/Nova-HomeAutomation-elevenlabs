@@ -15,6 +15,12 @@ from dataclasses import dataclass, field
 STABLE_DETECTION_SECONDS = float(os.environ.get("NOVA_STABLE_DETECTION_S", "3.5"))
 UNKNOWN_STABLE_SECONDS = float(os.environ.get("NOVA_UNKNOWN_STABLE_S", "3.5"))
 FACE_TRULY_LOST_SECONDS = float(os.environ.get("NOVA_FACE_LOST_S", "5.0"))
+# Confidence decay rate (per second of absence). Used in current_state
+# to age out the last-observed confidence so the ElevenLabs context
+# reflects "I last saw them clearly 2s ago, getting less sure" rather
+# than the stale point-in-time number. Pure read-time computation, so
+# there's no compounding-decay bug from re-applying it on every poll.
+CONFIDENCE_DECAY_PER_S = float(os.environ.get("NOVA_CONFIDENCE_DECAY_PER_S", "0.05"))
 
 
 @dataclass
@@ -162,6 +168,18 @@ class FacePresenceTracker:
 
         return events
 
+    def _decayed_confidence(self, state: "_KnownState", now: float) -> float:
+        """Confidence aged by CONFIDENCE_DECAY_PER_S * seconds_since_last_seen.
+
+        Important: the *stored* state.confidence is never mutated by
+        this — we compute the decayed value at read time. Mutating it
+        would compound on every poll, dropping toward zero
+        arbitrarily fast, and would clobber the true last-observed
+        value the next time a fresh confidence comes in.
+        """
+        age = max(0.0, now - state.last_seen)
+        return max(0.0, state.confidence - CONFIDENCE_DECAY_PER_S * age)
+
     def current_state(self) -> dict:
         """Snapshot of who is currently present and stable.
 
@@ -171,12 +189,18 @@ class FacePresenceTracker:
         orchestrator pushes to ElevenLabs as a contextual update, and
         we don't want a passer-by to leak into that.
 
+        Confidence in the returned dicts is decay-adjusted (see
+        _decayed_confidence) so a face that was last seen clearly 2 s
+        ago shows up with a slightly lower number than one seen this
+        tick — gives the agent a smoother, more honest signal.
+
         Returns:
             {
               "known": [{id, name, confidence}, ...],   # stable known identities
               "unknown_count": int,                      # stable unknown count
             }
         """
+        now = time.time()
         if self._primary_id is not None and self._primary_id in self._known:
             s = self._known[self._primary_id]
             if s.published and not s.lost_published:
@@ -184,13 +208,17 @@ class FacePresenceTracker:
                     "known": [{
                         "id": s.face_id,
                         "name": s.name,
-                        "confidence": s.confidence,
+                        "confidence": self._decayed_confidence(s, now),
                     }],
                     "unknown_count": 0,
                 }
         return {
             "known": [
-                {"id": s.face_id, "name": s.name, "confidence": s.confidence}
+                {
+                    "id": s.face_id,
+                    "name": s.name,
+                    "confidence": self._decayed_confidence(s, now),
+                }
                 for s in self._known.values()
                 if s.published and not s.lost_published
             ],
