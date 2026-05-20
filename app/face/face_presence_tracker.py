@@ -40,6 +40,19 @@ class FacePresenceTracker:
     Unknown faces don't have IDs, so they're tracked in aggregate: a
     single `face_unknown` event fires once unknowns are stable, with the
     current count.
+
+    **Primary speaker lock.** Once the first face_recognized event fires
+    in a session, that face becomes the "primary speaker" and the
+    tracker's `current_state()` filters down to ONLY that person until
+    they're truly lost. The orchestrator pushes `current_state()` to
+    ElevenLabs as contextual updates — without the lock, a bystander
+    walking by in a crowded scene gets stable, fires their own event,
+    and the agent gets told mid-conversation "now there's also Bob
+    here". With the lock, the conversation stays anchored to whoever
+    Nova locked onto first. Lock releases automatically when the
+    primary face is dropped from `_known` (i.e. after
+    FACE_TRULY_LOST_SECONDS of absence). Other faces are still tracked
+    internally — they just don't pollute the ElevenLabs context.
     """
 
     def __init__(self):
@@ -47,6 +60,10 @@ class FacePresenceTracker:
         self._unknown_count: int = 0
         self._unknown_first_seen: float | None = None
         self._unknown_published: bool = False
+        # Primary speaker lock — see class docstring. None when no
+        # speaker is locked (initial state or just released).
+        self._primary_id: str | None = None
+        self._primary_locked_at: float = 0.0
 
     def update(self, faces: list[dict]) -> list[dict]:
         now = time.time()
@@ -118,10 +135,41 @@ class FacePresenceTracker:
                 if state.lost_published:
                     del self._known[face_id]
 
+        # Primary speaker lock — acquire on the first face_recognized
+        # event of the session (highest-confidence if multiple fired
+        # this tick), release when the primary id is no longer tracked.
+        if self._primary_id is not None and self._primary_id not in self._known:
+            print(f"[FACE] primary speaker lock RELEASED (id={self._primary_id} "
+                  f"truly lost after {now - self._primary_locked_at:.1f}s)")
+            self._primary_id = None
+            self._primary_locked_at = 0.0
+        if self._primary_id is None:
+            new_primary = None
+            best_conf = -1.0
+            for evt in events:
+                if evt.get("event") != "face_recognized":
+                    continue
+                conf = float(evt.get("confidence", 0.0))
+                if conf > best_conf:
+                    best_conf = conf
+                    new_primary = evt["id"]
+            if new_primary:
+                self._primary_id = new_primary
+                self._primary_locked_at = now
+                pname = self._known[new_primary].name if new_primary in self._known else "?"
+                print(f"[FACE] primary speaker lock ACQUIRED: {pname} "
+                      f"(id={new_primary}, conf={best_conf:.2f})")
+
         return events
 
     def current_state(self) -> dict:
         """Snapshot of who is currently present and stable.
+
+        While a primary speaker is locked (see class docstring), the
+        returned `known` list contains only the primary and
+        `unknown_count` is forced to 0 — this is the snapshot the
+        orchestrator pushes to ElevenLabs as a contextual update, and
+        we don't want a passer-by to leak into that.
 
         Returns:
             {
@@ -129,6 +177,17 @@ class FacePresenceTracker:
               "unknown_count": int,                      # stable unknown count
             }
         """
+        if self._primary_id is not None and self._primary_id in self._known:
+            s = self._known[self._primary_id]
+            if s.published and not s.lost_published:
+                return {
+                    "known": [{
+                        "id": s.face_id,
+                        "name": s.name,
+                        "confidence": s.confidence,
+                    }],
+                    "unknown_count": 0,
+                }
         return {
             "known": [
                 {"id": s.face_id, "name": s.name, "confidence": s.confidence}
@@ -154,3 +213,5 @@ class FacePresenceTracker:
         self._unknown_count = 0
         self._unknown_first_seen = None
         self._unknown_published = False
+        self._primary_id = None
+        self._primary_locked_at = 0.0
