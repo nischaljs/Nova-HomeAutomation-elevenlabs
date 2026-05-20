@@ -195,6 +195,29 @@ def _pick_primary_face(faces: list[dict]) -> dict | None:
     return max(faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
 
 
+def _crop_face_with_margin(image: np.ndarray, bbox, margin_frac: float = 0.25,
+                           thumb_px: int = 256) -> np.ndarray | None:
+    """Crop a face region with a percentage margin and resize to a square
+    thumbnail. Margin gives the /setup UI grid a bit of context around
+    the face instead of a tight head-shot. Must match the cropping that
+    the /setup upload path uses (routes.py::_crop_face_to_thumb) so
+    register-time thumbnails and upload-time thumbnails look the same."""
+    x, y, w, h = bbox
+    h_img, w_img = image.shape[:2]
+    margin = int(margin_frac * max(w, h))
+    x0 = max(0, x - margin)
+    y0 = max(0, y - margin)
+    x1 = min(w_img, x + w + margin)
+    y1 = min(h_img, y + h + margin)
+    crop = image[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+    try:
+        return cv2.resize(crop, (thumb_px, thumb_px), interpolation=cv2.INTER_AREA)
+    except cv2.error:
+        return None
+
+
 def _save_per_photo_artifacts(
     storage,
     identity_id: str,
@@ -206,6 +229,13 @@ def _save_per_photo_artifacts(
     thumbnails and to re-average the identity when the user adds or
     removes photos. Best-effort — registration succeeds even if this
     fails. Returns the count actually written.
+
+    Write order is .npy first, then .jpg. The /setup `_list_photo_ids`
+    filter requires both files to exist, so a crash between the two
+    leaves an orphan .npy that's invisible to listing AND to re-
+    averaging (re-averaging also goes through _list_photo_ids). The
+    opposite order would risk a future re-average implementation
+    picking up an orphan .npy. Same rule as routes.py::_save_photo_files.
     """
     if not usable:
         return 0
@@ -218,23 +248,28 @@ def _save_per_photo_artifacts(
         return 0
     written = 0
     for small, face, emb in usable:
-        x, y, w, h = face["bbox"]
-        x0, y0 = max(0, x), max(0, y)
-        crop = small[y0:y0 + h, x0:x0 + w]
-        if crop.size == 0:
+        thumb = _crop_face_with_margin(small, face["bbox"])
+        if thumb is None:
             continue
+        photo_id = uuid.uuid4().hex[:12]
+        npy_path = photos_dir / f"{photo_id}.npy"
+        jpg_path = photos_dir / f"{photo_id}.jpg"
         try:
-            thumb = cv2.resize(crop, (256, 256))
-        except cv2.error:
-            continue
-        photo_id = uuid.uuid4().hex
-        try:
-            cv2.imwrite(str(photos_dir / f"{photo_id}.jpg"), thumb,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            np.save(photos_dir / f"{photo_id}.npy", emb)
+            np.save(npy_path, emb.astype(np.float32))
+            ok = cv2.imwrite(str(jpg_path), thumb,
+                             [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                # imwrite failed silently — clean up the orphan .npy so
+                # re-averaging stays consistent with what _list_photo_ids
+                # advertises.
+                npy_path.unlink(missing_ok=True)
+                continue
             written += 1
         except OSError as e:
             print(f"[FACE] photos: write failed for {photo_id}: {e} (skipping)")
+            # Best-effort cleanup of any partial file
+            npy_path.unlink(missing_ok=True)
+            jpg_path.unlink(missing_ok=True)
     return written
 
 

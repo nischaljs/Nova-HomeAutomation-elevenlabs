@@ -111,10 +111,23 @@ async def main():
     print(f"Liveness API on port {PORT_API}")
     # Loud banner for the admin UI so the operator never has to guess
     # the URL — the Pi typically has no monitor, so this is the only
-    # surface telling them where to point a phone browser.
+    # surface telling them where to point a phone browser. Resolve the
+    # real LAN IP (not 127.0.0.1) by asking the kernel which interface
+    # would route to a public IP; we don't actually send anything.
+    import socket
+    lan_ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        pass  # No network — leave as 127.0.0.1; operator at the Pi can still curl
     print("=" * 64)
-    print(f"  Admin UI:   http://<this-pi-ip>:{PORT_API}/setup")
-    print(f"  Health:     http://<this-pi-ip>:{PORT_API}/api/status")
+    print(f"  Admin UI:   http://{lan_ip}:{PORT_API}/setup")
+    print(f"  Health:     http://{lan_ip}:{PORT_API}/api/status")
     print("=" * 64)
     print("Camera + Face Monitoring active. Agent will wake on engaged face.")
 
