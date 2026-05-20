@@ -50,6 +50,16 @@ DETECT_TARGET_W = int(os.environ.get("NOVA_DETECT_W", "480"))
 DETECT_TARGET_H = int(os.environ.get("NOVA_DETECT_H", "360"))
 DETECT_INTERVAL_S = float(os.environ.get("NOVA_DETECT_INTERVAL_S", "0.15"))
 RECOGNIZE_INTERVAL_S = float(os.environ.get("NOVA_RECOGNIZE_INTERVAL_S", "0.5"))
+# Post-unknown cooldown. In a crowded scene with no enrolled people
+# visible (a fair, a hallway during a break), the recognize loop fires
+# every 0.5s, burns ~80ms of SFace per face, and returns "all unknown"
+# every time — and each call is another chance for a borderline match
+# to misfire as a known identity. Once we've seen UNKNOWN_STREAK_THROTTLE_AT
+# consecutive ticks with zero known faces, slow the loop to
+# UNKNOWN_COOLDOWN_INTERVAL_S until a known face reappears. Instant
+# resume on the first known-face tick.
+UNKNOWN_STREAK_THROTTLE_AT = int(os.environ.get("NOVA_UNKNOWN_THROTTLE_AT", "5"))
+UNKNOWN_COOLDOWN_INTERVAL_S = float(os.environ.get("NOVA_UNKNOWN_COOLDOWN_S", "1.5"))
 # Idle-mode throttling. When nobody's been in front of the camera for
 # IDLE_AFTER_S seconds, drop detection from 6.6 Hz to ~1 Hz. That's a
 # ~70 % CPU cut during empty-room time without sacrificing wake-up
@@ -282,6 +292,8 @@ class VisionPipeline:
 
     def _recognize_loop(self):
         last_recognize = 0.0
+        unknown_streak = 0
+        was_throttled = False
         while self._running:
             t0 = time.monotonic()
             if not self._bridge.models_ready:
@@ -291,7 +303,25 @@ class VisionPipeline:
                 time.sleep(0.5)
                 continue
 
-            if time.monotonic() - last_recognize < RECOGNIZE_INTERVAL_S:
+            # Pick this tick's interval: normal cadence unless we've
+            # had a streak of all-unknown results (see
+            # UNKNOWN_STREAK_THROTTLE_AT comment at the top).
+            is_throttled = unknown_streak >= UNKNOWN_STREAK_THROTTLE_AT
+            current_interval = (
+                UNKNOWN_COOLDOWN_INTERVAL_S if is_throttled else RECOGNIZE_INTERVAL_S
+            )
+            if is_throttled != was_throttled:
+                if is_throttled:
+                    print(f"[VISION] recognize cooling down after "
+                          f"{unknown_streak} all-unknown ticks → "
+                          f"{1/UNKNOWN_COOLDOWN_INTERVAL_S:.1f}Hz "
+                          f"(was {1/RECOGNIZE_INTERVAL_S:.1f}Hz)")
+                else:
+                    print(f"[VISION] recognize resumed normal rate "
+                          f"({1/RECOGNIZE_INTERVAL_S:.1f}Hz) — known face seen")
+                was_throttled = is_throttled
+
+            if time.monotonic() - last_recognize < current_interval:
                 time.sleep(MIN_SLEEP_S)
                 continue
 
@@ -310,13 +340,22 @@ class VisionPipeline:
                 self._stats_recogs += 1
                 self._latest.publish_recognition(recognized, time.monotonic())
                 last_recognize = time.monotonic()
+                # Update unknown streak: any non-unknown result resets;
+                # all-unknown (or empty) increments. recognize_in returns
+                # an empty list when faces_raw is empty, which we treat
+                # as 'no positive evidence' — same as all-unknown.
+                has_known = any(not r.get("unknown") for r in recognized)
+                if has_known:
+                    unknown_streak = 0
+                else:
+                    unknown_streak += 1
             except Exception as e:
                 print(f"[VISION] recognize loop error (ignored): "
                       f"{type(e).__name__}: {e}")
                 last_recognize = time.monotonic()
 
             elapsed = time.monotonic() - t0
-            sleep_left = max(MIN_SLEEP_S, RECOGNIZE_INTERVAL_S - elapsed)
+            sleep_left = max(MIN_SLEEP_S, current_interval - elapsed)
             time.sleep(sleep_left)
 
     # ------------------------------------------------------------------
