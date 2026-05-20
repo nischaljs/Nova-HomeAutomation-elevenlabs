@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nova — Face Identities</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --accent-hover: #4493f8;
+    --danger: #da3633;
+    --danger-hover: #f85149;
+    --ok: #2ea043;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .empty {
+    border: 1px dashed var(--border);
+    padding: 32px; border-radius: 8px;
+    text-align: center; color: var(--muted);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    display: flex; flex-direction: column;
+  }
+  .card .thumb {
+    width: 100%; aspect-ratio: 1;
+    background: var(--panel-2);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden; margin-bottom: 10px;
+    color: var(--muted); font-size: 12px;
+  }
+  .card .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .card .name {
+    font-size: 15px; font-weight: 600; margin-bottom: 2px;
+    word-break: break-word;
+  }
+  .card .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .card .id   { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+  button {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #232b35; border-color: #444c56; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  button.danger:hover { background: var(--danger); color: white; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: none; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: min(720px, 92vw);
+    max-height: 88vh;
+    overflow: auto;
+    padding: 20px;
+  }
+  .modal h2 { margin: 0 0 12px 0; font-size: 16px; }
+  .modal label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .modal input[type="text"] {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .modal input[type="file"] { color: var(--text); font-family: inherit; }
+  .modal-row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+  .photos-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 10px; margin-top: 12px;
+  }
+  .photo-card {
+    position: relative;
+    aspect-ratio: 1;
+    background: var(--panel-2);
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .photo-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .photo-card .del {
+    position: absolute; top: 4px; right: 4px;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .photo-card .del:hover { background: var(--danger); border-color: var(--danger); }
+  .upload-results { font-size: 12px; margin-top: 10px; }
+  .upload-results .ok { color: var(--ok); }
+  .upload-results .fail { color: var(--danger); }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 10px 14px; border-radius: 6px;
+    max-width: 340px; font-size: 13px;
+    z-index: 200;
+  }
+  .toast.err { border-left-color: var(--danger); }
+  .toast.ok  { border-left-color: var(--ok); }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Nova — Face Identities</h1>
+    <div class="sub">Manage the people Nova recognizes. Changes apply to the next recognition tick.</div>
+  </div>
+  <button class="primary" id="btn-refresh">Refresh</button>
+</header>
+
+<main>
+  <div id="root"></div>
+</main>
+
+<!-- Edit modal -->
+<div class="modal-bg" id="modal-bg">
+  <div class="modal" id="modal">
+    <h2 id="modal-title">Edit identity</h2>
+
+    <label for="rename-input">Name</label>
+    <input type="text" id="rename-input" />
+    <div class="modal-row">
+      <button id="rename-save" class="primary">Save name</button>
+    </div>
+
+    <hr style="margin: 18px 0; border: 0; border-top: 1px solid var(--border);" />
+
+    <label>Upload more photos</label>
+    <input type="file" id="upload-input" multiple accept="image/*" />
+    <div class="modal-row">
+      <button id="upload-go" class="primary">Upload</button>
+    </div>
+    <div class="upload-results" id="upload-results"></div>
+
+    <hr style="margin: 18px 0; border: 0; border-top: 1px solid var(--border);" />
+
+    <label>All photos (<span id="photo-count">0</span>)</label>
+    <div class="photos-grid" id="photos-grid"></div>
+
+    <div class="modal-row" style="margin-top: 18px;">
+      <button id="modal-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Vanilla JS, no template strings into innerHTML. Every node is created
+// via document.createElement and every text-node via textContent — so
+// user-supplied names (which can contain anything) can never become
+// markup.
+const $ = (s) => document.querySelector(s);
+const el = (t, attrs, ...kids) => {
+  const n = document.createElement(t);
+  if (attrs) {
+    for (const k of Object.keys(attrs)) {
+      const v = attrs[k];
+      if (k === "class") n.className = v;
+      else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+      else n.setAttribute(k, v);
+    }
+  }
+  for (const k of kids) {
+    if (k == null) continue;
+    n.append(typeof k === "string" ? document.createTextNode(k) : k);
+  }
+  return n;
+};
+const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); };
+
+let state = { identities: [], currentId: null };
+
+function toast(msg, kind) {
+  const t = el("div", { class: "toast " + (kind || "ok") }, msg);
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts || {});
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (_) { data = { detail: text }; }
+  if (!res.ok) {
+    const msg = (data && (data.detail || data.message)) || ("HTTP " + res.status);
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  return data;
+}
+
+function showLoading(node, label) {
+  clear(node);
+  node.append(el("div", { class: "empty" }, el("span", { class: "spinner" }), " " + label));
+}
+
+async function loadIdentities() {
+  const root = $("#root");
+  showLoading(root, "Loading identities…");
+  try {
+    const data = await api("/setup/api/identities");
+    state.identities = data;
+    renderList();
+  } catch (e) {
+    clear(root);
+    root.append(el("div", { class: "empty" }, "Failed to load: " + e.message));
+  }
+}
+
+function renderList() {
+  const root = $("#root");
+  clear(root);
+  if (!state.identities.length) {
+    root.append(el("div", { class: "empty" },
+      "No identities registered yet. Stand in front of Nova and say ",
+      el("em", {}, '"Nova, remember me as <name>"'),
+      " to register."));
+    return;
+  }
+  const grid = el("div", { class: "grid" });
+  for (const it of state.identities) grid.append(renderCard(it));
+  root.append(grid);
+}
+
+function renderCard(it) {
+  const thumb = el("div", { class: "thumb" });
+  if (it.thumb_url) {
+    thumb.append(el("img", { src: it.thumb_url, alt: it.name || "", loading: "lazy" }));
+  } else {
+    thumb.append("no photo");
+  }
+  return el("div", { class: "card" },
+    thumb,
+    el("div", { class: "name" }, it.name || "(unnamed)"),
+    el("div", { class: "meta" }, it.photo_count + " photo" + (it.photo_count === 1 ? "" : "s")),
+    el("div", { class: "id" }, it.id),
+    el("div", { class: "actions" },
+      el("button", { onclick: () => openModal(it.id) }, "Edit / Photos"),
+      el("button", { class: "danger", onclick: () => deleteIdentity(it) }, "Delete"),
+    ),
+  );
+}
+
+async function deleteIdentity(it) {
+  if (!confirm('Delete identity "' + (it.name || it.id) + '"? This removes all photos and embeddings.')) return;
+  try {
+    await api("/setup/api/identities/" + encodeURIComponent(it.id), { method: "DELETE" });
+    toast('Deleted "' + (it.name || it.id) + '"');
+    loadIdentities();
+  } catch (e) {
+    toast("Delete failed: " + e.message, "err");
+  }
+}
+
+async function openModal(id) {
+  state.currentId = id;
+  $("#modal-bg").classList.add("open");
+  clear($("#upload-results"));
+  $("#upload-input").value = "";
+  await refreshModal();
+}
+
+async function refreshModal() {
+  const id = state.currentId;
+  if (!id) return;
+  try {
+    const data = await api("/setup/api/identities/" + encodeURIComponent(id));
+    $("#modal-title").textContent = "Edit: " + (data.name || "(unnamed)");
+    $("#rename-input").value = data.name || "";
+    $("#photo-count").textContent = String(data.photos.length);
+    const grid = $("#photos-grid");
+    clear(grid);
+    if (!data.photos.length) {
+      grid.append(el("div", { class: "empty", style: "grid-column: 1/-1;" },
+        "No photos yet. Upload some above."));
+    }
+    for (const p of data.photos) {
+      grid.append(
+        el("div", { class: "photo-card" },
+          el("img", { src: p.url, alt: p.id, loading: "lazy" }),
+          el("button", {
+            class: "del",
+            title: "Delete this photo",
+            onclick: () => deletePhoto(p.id),
+          }, "x"),
+        ),
+      );
+    }
+  } catch (e) {
+    toast("Load failed: " + e.message, "err");
+  }
+}
+
+function closeModal() {
+  $("#modal-bg").classList.remove("open");
+  state.currentId = null;
+}
+
+async function renameSave() {
+  const id = state.currentId;
+  const name = $("#rename-input").value.trim();
+  if (!name) { toast("Name cannot be empty", "err"); return; }
+  try {
+    await api("/setup/api/identities/" + encodeURIComponent(id) + "/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+    toast("Renamed");
+    await loadIdentities();
+    await refreshModal();
+  } catch (e) {
+    toast("Rename failed: " + e.message, "err");
+  }
+}
+
+async function uploadGo() {
+  const id = state.currentId;
+  const files = $("#upload-input").files;
+  if (!files || !files.length) { toast("Pick at least one image", "err"); return; }
+  const fd = new FormData();
+  for (let i = 0; i < files.length; i++) fd.append("files", files[i]);
+
+  const box = $("#upload-results");
+  clear(box);
+  box.append(el("span", { class: "spinner" }), " Uploading…");
+
+  try {
+    const data = await api("/setup/api/identities/" + encodeURIComponent(id) + "/photos", {
+      method: "POST",
+      body: fd,
+    });
+    renderUploadResults(data);
+    await loadIdentities();
+    await refreshModal();
+    $("#upload-input").value = "";
+  } catch (e) {
+    clear(box);
+    toast("Upload failed: " + e.message, "err");
+  }
+}
+
+function renderUploadResults(data) {
+  const box = $("#upload-results");
+  clear(box);
+  const head = el("div", {},
+    data.accepted_count + " accepted, " + (data.results.length - data.accepted_count) +
+    " rejected. " + data.total_photos + " total photos now (averaged from " +
+    data.averaged_from + ").");
+  box.append(head);
+  for (const r of data.results) {
+    const line = (r.accepted ? "OK  " : "x   ") + (r.filename || "(unnamed)") +
+                 (r.reason ? "  — " + r.reason : "");
+    box.append(el("div", { class: r.accepted ? "ok" : "fail" }, line));
+  }
+}
+
+async function deletePhoto(pid) {
+  const id = state.currentId;
+  if (!confirm("Delete this photo? Embedding will be re-averaged from remaining photos.")) return;
+  try {
+    const data = await api(
+      "/setup/api/identities/" + encodeURIComponent(id) +
+      "/photos/" + encodeURIComponent(pid),
+      { method: "DELETE" });
+    toast("Photo deleted (" + data.total_photos + " remaining)");
+    await loadIdentities();
+    await refreshModal();
+  } catch (e) {
+    toast("Delete failed: " + e.message, "err");
+  }
+}
+
+$("#btn-refresh").addEventListener("click", loadIdentities);
+$("#modal-close").addEventListener("click", closeModal);
+$("#modal-bg").addEventListener("click", (e) => { if (e.target.id === "modal-bg") closeModal(); });
+$("#rename-save").addEventListener("click", renameSave);
+$("#upload-go").addEventListener("click", uploadGo);
+
+loadIdentities();
+</script>
+</body>
+</html>

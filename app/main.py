@@ -43,6 +43,12 @@ builtins.print = _ts_print
 app = FastAPI()
 orchestrator = Orchestrator()
 
+# Admin UI for managing saved face identities at /setup. The router talks
+# to the same FaceRecognitionBridge singleton the rest of the app uses,
+# so changes made through the UI take effect on the next recognize tick.
+from app.setup import router as setup_router  # noqa: E402
+app.include_router(setup_router)
+
 
 @app.get("/api/check")
 async def check():
@@ -103,6 +109,13 @@ async def main():
           f"display={'yes' if _HAS_DISPLAY else 'no — headless'}")
     await orchestrator.start()
     print(f"Liveness API on port {PORT_API}")
+    # Loud banner for the admin UI so the operator never has to guess
+    # the URL — the Pi typically has no monitor, so this is the only
+    # surface telling them where to point a phone browser.
+    print("=" * 64)
+    print(f"  Admin UI:   http://<this-pi-ip>:{PORT_API}/setup")
+    print(f"  Health:     http://<this-pi-ip>:{PORT_API}/api/status")
+    print("=" * 64)
     print("Camera + Face Monitoring active. Agent will wake on engaged face.")
 
     api_server = uvicorn.Server(
