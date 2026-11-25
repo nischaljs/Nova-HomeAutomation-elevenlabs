@@ -595,6 +595,19 @@ class FaceRecognitionBridge:
     def list_identities(self) -> dict:
         return self.system.list_identities()
 
+    def invalidate_cache_public(self) -> None:
+        """External callers (e.g. the /setup admin UI) use this after they
+        mutate embeddings or metadata on disk so the next recognize() call
+        re-reads from disk instead of using a stale matrix cache. Also
+        clears FaceStorage's internal cache so load_all/load_matrix
+        actually re-scan."""
+        self._invalidate_matrix_cache()
+        try:
+            self.system.storage._cache_valid = False
+            self.system.storage._matrix = None
+        except AttributeError:
+            pass
+
 
 FACES_BRIDGE = None
 REG_COLLECTOR = None

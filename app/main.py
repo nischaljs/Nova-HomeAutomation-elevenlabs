@@ -43,6 +43,12 @@ builtins.print = _ts_print
 app = FastAPI()
 orchestrator = Orchestrator()
 
+# Admin UI for managing saved face identities at /setup. The router talks
+# to the same FaceRecognitionBridge singleton the rest of the app uses,
+# so changes made through the UI take effect on the next recognize tick.
+from app.setup import router as setup_router  # noqa: E402
+app.include_router(setup_router)
+
 
 @app.get("/api/check")
 async def check():
